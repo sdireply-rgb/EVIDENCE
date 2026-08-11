@@ -1890,17 +1890,27 @@ function exportContractPdf(ct, format){
    ============================================================ */
 let rdvView = 'liste'; // 'liste' | 'semaine'
 let rdvWeekOffset = 0;
+let rdvSelected = new Set(); // ids des RDV cochés pour suppression en masse
 
 function appointmentStatusLabel(s){ return ({planifie:'Planifié', confirme:'Confirmé', termine:'Terminé', annule:'Annulé'})[s] || s; }
 function appointmentStatusPillClass(s){ return ({planifie:'brouillon', confirme:'envoye', termine:'paye', annule:'brouillon'})[s] || 'brouillon'; }
 
 function renderAppointments(){
+  // on ne garde en sélection que des ids de RDV qui existent toujours
+  rdvSelected.forEach(id=>{ if(!db.appointments.find(a=>a.id===id)) rdvSelected.delete(id); });
+  const nbSel = rdvSelected.size;
   const toolbar = `
     <div class="toolbar">
       <div class="filters">
         <button class="btn small ${rdvView==='liste'?'':'secondary'}" id="rdvViewListe">Liste</button>
         <button class="btn small ${rdvView==='semaine'?'':'secondary'}" id="rdvViewSemaine">Semaine</button>
       </div>
+      ${rdvView==='liste' && db.appointments.length ? `
+      <div class="filters" style="margin-left:auto;">
+        ${nbSel>0 ? `<span style="font-size:11.5px;color:var(--muted);align-self:center;">${nbSel} sélectionné(s)</span>` : ''}
+        <button class="btn small danger" id="rdvDeleteSelectedBtn" ${nbSel===0?'disabled':''}>🗑 Supprimer la sélection${nbSel>0?` (${nbSel})`:''}</button>
+        <button class="btn small danger" id="rdvDeleteAllBtn">🗑 Supprimer tous les RDV</button>
+      </div>` : ''}
     </div>`;
   return toolbar + (rdvView==='liste' ? renderAppointmentsList() : renderAppointmentsWeek());
 }
@@ -1908,13 +1918,19 @@ function renderAppointments(){
 function renderAppointmentsList(){
   if(!db.appointments.length) return `<div class="empty"><b>Aucun rendez-vous</b>Planifie ton premier rendez-vous.</div>`;
   const list = [...db.appointments].sort((a,b)=> (a.date+((a.heure)||'00:00')).localeCompare(b.date+((b.heure)||'00:00')));
+  const allChecked = list.length>0 && list.every(r=>rdvSelected.has(r.id));
   return `<table class="grid">
-    <tr><th>Date</th><th>Heure</th><th>Contact</th><th>Objet</th><th>Lieu</th><th>Statut</th><th></th></tr>
+    <tr>
+      <th style="width:26px;"><input type="checkbox" id="rdvSelectAll" ${allChecked?'checked':''}></th>
+      <th>Date</th><th>Heure</th><th>Contact</th><th>Objet</th><th>Lieu</th><th>Statut</th><th></th>
+    </tr>
     ${list.map(r=>{
       const c = db.contacts.find(c=>c.id===r.contactId);
       const objetAff = r.objet || r.titre || '';
       const clientAff = c ? c.nom : (r.clientLabel || '—');
+      const checked = rdvSelected.has(r.id);
       return `<tr>
+        <td><input type="checkbox" class="rdv-check" data-id="${r.id}" ${checked?'checked':''}></td>
         <td>${fmtDate(r.date)}</td>
         <td style="font-family:var(--mono)">${r.heure||'—'}</td>
         <td>${esc(clientAff)}</td>
@@ -1985,8 +2001,49 @@ function bindAppointmentView(){
   if(next) next.onclick = ()=>{ rdvWeekOffset++; render(); };
   if(tod) tod.onclick = ()=>{ rdvWeekOffset=0; render(); };
   document.querySelectorAll('.edit-rdv').forEach(el=>el.onclick=()=>openAppointmentModal(el.dataset.id));
-  document.querySelectorAll('.del-rdv').forEach(el=>el.onclick=()=>{ if(confirm('Supprimer ce rendez-vous ?')){ db.appointments=db.appointments.filter(a=>a.id!==el.dataset.id); save(); render(); } });
+  document.querySelectorAll('.del-rdv').forEach(el=>el.onclick=()=>{ if(confirm('Supprimer ce rendez-vous ?')){ db.appointments=db.appointments.filter(a=>a.id!==el.dataset.id); rdvSelected.delete(el.dataset.id); save(); render(); } });
   document.querySelectorAll('.ics-rdv').forEach(el=>el.onclick=()=>exportAppointmentIcs(db.appointments.find(a=>a.id===el.dataset.id)));
+
+  // ---- Sélection multiple + suppression en masse ----
+  document.querySelectorAll('.rdv-check').forEach(el=>{
+    el.onclick = (e)=>{ e.stopPropagation(); };
+    el.onchange = ()=>{
+      if(el.checked) rdvSelected.add(el.dataset.id); else rdvSelected.delete(el.dataset.id);
+      render();
+    };
+  });
+  const selectAll = document.getElementById('rdvSelectAll');
+  if(selectAll){
+    selectAll.onclick = (e)=> e.stopPropagation();
+    selectAll.onchange = ()=>{
+      const list = [...db.appointments].sort((a,b)=> (a.date+((a.heure)||'00:00')).localeCompare(b.date+((b.heure)||'00:00')));
+      if(selectAll.checked) list.forEach(r=>rdvSelected.add(r.id));
+      else list.forEach(r=>rdvSelected.delete(r.id));
+      render();
+    };
+  }
+  const deleteSelectedBtn = document.getElementById('rdvDeleteSelectedBtn');
+  if(deleteSelectedBtn){
+    deleteSelectedBtn.onclick = ()=>{
+      const n = rdvSelected.size;
+      if(n===0) return;
+      if(!confirm(`Supprimer les ${n} rendez-vous sélectionné(s) d'Evidence ?\n\nCeci ne supprime rien côté Dolibarr : seuls les RDV importés localement dans Evidence sont retirés (ils pourront être réimportés à la prochaine synchro si tu ne les supprimes pas aussi côté Dolibarr).`)) return;
+      db.appointments = db.appointments.filter(a=>!rdvSelected.has(a.id));
+      rdvSelected.clear();
+      save(); render();
+    };
+  }
+  const deleteAllBtn = document.getElementById('rdvDeleteAllBtn');
+  if(deleteAllBtn){
+    deleteAllBtn.onclick = ()=>{
+      const n = db.appointments.length;
+      if(n===0) return;
+      if(!confirm(`⚠ Supprimer TOUS les rendez-vous (${n}) d'Evidence ?\n\nCette action est irréversible côté Evidence et ne touche pas Dolibarr : les RDV importés depuis Dolibarr pourront revenir à la prochaine synchro si tu ne les supprimes pas aussi là-bas.\n\nConfirmer la suppression complète ?`)) return;
+      db.appointments = [];
+      rdvSelected.clear();
+      save(); render();
+    };
+  }
 }
 
 function openAppointmentModal(id){
@@ -2507,9 +2564,32 @@ async function syncDolibarrMorning(dateISO){
   const shipmentsResult = await syncDolibarrShipmentsPull().catch(e=>({ added:0, updated:0, error:e.message }));
   dolLog('info', `Synchro matin — recherche des RDV Dolibarr du ${dateISO}...`);
   try{
-    const filt = encodeURIComponent(`(t.datep:>=:'${dateISO} 00:00:00') and (t.datep:<=:'${dateISO} 23:59:59')`);
-    const events = await dolFetch(`/agendaevents?sqlfilters=${filt}&limit=200`);
-    const list = Array.isArray(events) ? events : [];
+    // On élargit volontairement la fenêtre d'un jour de chaque côté (le serveur Dolibarr peut être
+    // dans un fuseau horaire différent de celui du navigateur) : sans cette marge, un RDV posé en
+    // toute fin/début de journée peut tomber juste hors de la fenêtre stricte 00:00–23:59 et
+    // "disparaître" de la synchro. On filtre ensuite précisément côté client sur la vraie date locale.
+    const prevISO = new Date(new Date(dateISO+'T00:00:00').getTime() - 86400000).toISOString().slice(0,10);
+    const nextISO = new Date(new Date(dateISO+'T00:00:00').getTime() + 86400000).toISOString().slice(0,10);
+    const filt = encodeURIComponent(`(t.datep:>=:'${prevISO} 00:00:00') and (t.datep:<=:'${nextISO} 23:59:59')`);
+    let all = [];
+    let page = 0;
+    const limit = 200;
+    while(true){
+      const batch = await dolFetch(`/agendaevents?sqlfilters=${filt}&sortfield=t.datep&sortorder=ASC&limit=${limit}&page=${page}`);
+      const arr = Array.isArray(batch) ? batch : [];
+      all = all.concat(arr);
+      if(arr.length < limit) break;
+      page++;
+      if(page>20) break; // sécurité anti-boucle
+    }
+    // filtre client-side précis sur la date locale réelle du RDV, pour ne garder que ceux du jour demandé
+    const list = all.filter(ev=>{
+      const { date } = dolUnixToISO(ev.datep);
+      return date === dateISO;
+    });
+    if(all.length && !list.length){
+      dolLog('info', `${all.length} événement(s) trouvé(s) autour du ${dateISO} mais aucun exactement ce jour-là après recalage horaire — vérifie l'heure du serveur Dolibarr si ça se reproduit.`);
+    }
     let added = 0, skipped = 0;
     list.forEach(ev=>{
       const already = db.appointments.find(a=>a.dolibarrId===String(ev.id));
@@ -3490,6 +3570,12 @@ function renderTicketZ(){
       Dernière synchro produits/services : ${db.dolibarr.lastProductsSync? fmtDate(db.dolibarr.lastProductsSync) : '—'} ·
       Dernière synchro matin : ${db.dolibarr.lastMorningSync? fmtDate(db.dolibarr.lastMorningSync) : '—'} ·
       Dernière synchro soir : ${db.dolibarr.lastEveningSync? fmtDate(db.dolibarr.lastEveningSync) : '—'}
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;">
+      ℹ️ Si des RDV créés dans Dolibarr n'apparaissent pas après la synchro matin, vérifie surtout :
+      le compte/clé API utilisé a bien le droit <b>« Agenda &gt; Lire tous les agendas »</b> dans Dolibarr (sinon seuls
+      les RDV assignés à cet utilisateur remontent), et que le RDV a bien une <b>date de début</b> renseignée
+      (les RDV sans date ne peuvent pas être rattachés à une journée précise).
     </div>
     <div class="sync-log" style="margin-top:12px;">${renderSyncLogLines()}</div>
   </div>
