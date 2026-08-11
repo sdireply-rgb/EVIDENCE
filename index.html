@@ -171,7 +171,7 @@ label{font-size:12px;font-weight:600;color:var(--slate);display:block;margin-bot
 .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;}
 
 /* modal */
-.overlay{position:fixed;inset:0;background:rgba(22,26,35,.55);display:none;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;z-index:50;}
+.overlay{position:fixed;inset:0;background:var(--paper);display:none;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;z-index:50;}
 .overlay.show{display:flex;}
 .modal{background:var(--panel);border-radius:8px;width:100%;max-width:640px;padding:26px 28px;box-shadow:0 20px 50px rgba(0,0,0,.25);}
 .modal h2{margin-top:0;font-size:17px;}
@@ -423,6 +423,48 @@ function save(){
   }
 }
 function uid(){ return 'x'+Math.random().toString(36).slice(2,10); }
+/* ---- Scanner caméra générique (réutilisé pour la saisie du n° de suivi ET la recherche de colis) ---- */
+async function scanBarcodeWithCamera(onResult){
+  if(!('BarcodeDetector' in window)){
+    alert("Le scan par caméra n'est pas pris en charge par ce navigateur. Utilise une douchette USB/Bluetooth (elle se comporte comme un clavier) ou saisis le code manuellement.");
+    return;
+  }
+  let stream;
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'environment' } });
+  }catch(err){ alert("Impossible d'accéder à la caméra."); return; }
+  const video = document.createElement('video');
+  video.srcObject = stream; video.setAttribute('playsinline','');
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:#000;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;';
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕ Fermer'; closeBtn.className='btn secondary';
+  closeBtn.style.cssText='position:absolute;top:16px;right:16px;';
+  video.style.cssText = 'max-width:92vw;max-height:80vh;';
+  overlay.appendChild(video); overlay.appendChild(closeBtn);
+  document.body.appendChild(overlay);
+  await video.play();
+  let stopped = false;
+  const stopAll = ()=>{ stopped = true; stream.getTracks().forEach(t=>t.stop()); overlay.remove(); };
+  closeBtn.onclick = stopAll;
+  try{
+    const detector = new BarcodeDetector();
+    const loop = async ()=>{
+      if(stopped) return;
+      try{
+        const codes = await detector.detect(video);
+        if(codes && codes.length){
+          playBeep(1600, 0.1);
+          stopAll();
+          onResult(codes[0].rawValue);
+          return;
+        }
+      }catch(err){ /* frame illisible, on continue */ }
+      requestAnimationFrame(loop);
+    };
+    loop();
+  }catch(err){ alert("Erreur du scanner caméra."); stopAll(); }
+}
 function playBeep(freq, dur){
   try{
     const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -753,6 +795,8 @@ function blIsLate(d){
   return d.type==='bl' && d.status==='envoye' && !!d.dateLivraisonPrevue && d.dateLivraisonPrevue < todayISO();
 }
 let blFilterStatus = 'all';
+let blSearchQuery = '';
+let blSearchFocused = false;
 let blShowAllHistory = false; // par défaut : liste Livraison = uniquement les livraisons du jour, l'historique se retrouve via la recherche 🔍
 function docTotals(d){
   let ht=0, tva=0;
@@ -775,14 +819,31 @@ function renderDocList(type){
   let toolbarHtml = '';
   if(isBl){
     const today = todayISO();
-    if(!blShowAllHistory) docs = docs.filter(d=>d.date===today);
+    // recherche par n° de suivi (scan ou saisie) : si une recherche est active, on cherche
+    // dans tout l'historique, pas seulement les livraisons du jour, pour retrouver le colis
+    // même s'il a été livré il y a plusieurs jours.
+    const q = blSearchQuery.trim().toLowerCase();
+    if(q){
+      docs = docs.filter(d=>{
+        const c = db.contacts.find(c=>c.id===d.contactId);
+        return (d.numeroSuivi||'').toLowerCase().includes(q) ||
+          (d.number||'').toLowerCase().includes(q) ||
+          (c && c.nom || d.clientLabel || '').toLowerCase().includes(q);
+      });
+    } else {
+      if(!blShowAllHistory) docs = docs.filter(d=>d.date===today);
+    }
     if(blFilterStatus==='retard') docs = docs.filter(d=>blIsLate(d));
     else if(blFilterStatus!=='all') docs = docs.filter(d=>d.status===blFilterStatus);
     const countRetard = db.documents.filter(d=>d.type==='bl' && blIsLate(d)).length;
     const countHistorique = db.documents.filter(d=>d.type==='bl' && d.date!==today).length;
     toolbarHtml = `
       <div class="toolbar">
-        <div class="filters">
+        <div class="filters" style="flex:1;">
+          <div style="display:flex;gap:6px;align-items:center;flex:1;max-width:320px;">
+            <input type="text" id="blSearchInput" value="${escAttr(blSearchQuery)}" placeholder="N° de suivi, colis ou client..." style="flex:1;">
+            <button type="button" class="btn small secondary" id="blSearchScanBtn" title="Scanner un colis avec la caméra">📷</button>
+          </div>
           <select id="blFilterStatus">
             <option value="all" ${blFilterStatus==='all'?'selected':''}>Tous les statuts</option>
             <option value="brouillon" ${blFilterStatus==='brouillon'?'selected':''}>Brouillon</option>
@@ -800,7 +861,8 @@ function renderDocList(type){
           Voir l'historique${countHistorique?' ('+countHistorique+')':''}
         </label>
       </div>
-      ${!blShowAllHistory ? `<p style="font-size:11.5px;color:var(--muted);margin:-8px 0 14px;">Seules les livraisons du jour (${fmtDate(today)}) sont listées ici${countHistorique?' — '+countHistorique+' livraison(s) plus ancienne(s) dans l\'historique':''}. Coche « Voir l'historique » pour les retrouver, ou utilise la recherche 🔍 en haut de page.</p>` : ''}`;
+      ${q ? `<p style="font-size:11.5px;color:var(--muted);margin:-8px 0 14px;">Recherche « ${esc(blSearchQuery)} » sur tout l'historique — ${docs.length} résultat(s).</p>`
+        : (!blShowAllHistory ? `<p style="font-size:11.5px;color:var(--muted);margin:-8px 0 14px;">Seules les livraisons du jour (${fmtDate(today)}) sont listées ici${countHistorique?' — '+countHistorique+' livraison(s) plus ancienne(s) dans l\'historique':''}. Coche « Voir l'historique » pour les retrouver, ou scanne/tape un n° de suivi ci-dessus.</p>` : '')}`;
   }
   if(!docs.length) return toolbarHtml + `<div class="empty"><b>Aucun document</b>${isBl && blFilterStatus!=='all' ? 'Aucune livraison ne correspond à ce filtre.' : (isBl ? 'Aucune livraison prévue aujourd\'hui.' : 'Crée ton premier '+docMeta(type).singular.toLowerCase()+'.')}</div>`;
   return toolbarHtml + `<table class="grid">
@@ -843,6 +905,21 @@ function bindDocListFilters(){
   if(sel) sel.onchange = ()=>{ blFilterStatus = sel.value; render(); };
   const hist = document.getElementById('blShowAllHistory');
   if(hist) hist.onchange = ()=>{ blShowAllHistory = hist.checked; render(); };
+  const searchInput = document.getElementById('blSearchInput');
+  if(searchInput){
+    searchInput.addEventListener('input', ()=>{ blSearchQuery = searchInput.value; blSearchFocused = true; render(); });
+    searchInput.addEventListener('blur', ()=>{ blSearchFocused = false; });
+    // ne remet le focus après un re-render que si l'utilisateur était bien en train d'y taper
+    // (sinon un simple changement de filtre ferait apparaître le clavier sans raison)
+    if(blSearchFocused){
+      searchInput.focus();
+      const val = searchInput.value; searchInput.value=''; searchInput.value = val;
+    }
+  }
+  const scanBtn = document.getElementById('blSearchScanBtn');
+  if(scanBtn) scanBtn.onclick = ()=>{
+    scanBarcodeWithCamera(code=>{ blSearchQuery = code; render(); });
+  };
 }
 
 function openDocEditor(id, type){
@@ -1148,46 +1225,8 @@ function openDocEditor(id, type){
     });
 
     // --- Scan via caméra (si le navigateur le permet) ---
-    document.getElementById('camScanBtn').onclick = async ()=>{
-      if(!('BarcodeDetector' in window)){
-        alert("Le scan par caméra n'est pas pris en charge par ce navigateur. Utilise une douchette USB/Bluetooth (elle se comporte comme un clavier) ou saisis le code manuellement.");
-        return;
-      }
-      let stream;
-      try{
-        stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'environment' } });
-      }catch(err){ alert("Impossible d'accéder à la caméra."); return; }
-      const video = document.createElement('video');
-      video.srcObject = stream; video.setAttribute('playsinline','');
-      const overlay = document.createElement('div');
-      overlay.style.cssText = 'position:fixed;inset:0;background:#000;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;';
-      const closeBtn = document.createElement('button');
-      closeBtn.textContent = '✕ Fermer'; closeBtn.className='btn secondary';
-      closeBtn.style.cssText='position:absolute;top:16px;right:16px;';
-      video.style.cssText = 'max-width:92vw;max-height:80vh;';
-      overlay.appendChild(video); overlay.appendChild(closeBtn);
-      document.body.appendChild(overlay);
-      await video.play();
-      let stopped = false;
-      const stopAll = ()=>{ stopped = true; stream.getTracks().forEach(t=>t.stop()); overlay.remove(); };
-      closeBtn.onclick = stopAll;
-      try{
-        const detector = new BarcodeDetector();
-        const loop = async ()=>{
-          if(stopped) return;
-          try{
-            const codes = await detector.detect(video);
-            if(codes && codes.length){
-              suiviInput.value = codes[0].rawValue;
-              playBeep(1600, 0.1);
-              stopAll();
-              return;
-            }
-          }catch(err){ /* frame illisible, on continue */ }
-          requestAnimationFrame(loop);
-        };
-        loop();
-      }catch(err){ alert("Erreur du scanner caméra."); stopAll(); }
+    document.getElementById('camScanBtn').onclick = ()=>{
+      scanBarcodeWithCamera(code=>{ suiviInput.value = code; });
     };
   }
 
@@ -2823,7 +2862,12 @@ async function syncDolibarrShipmentsPull(){
     let added=0, updated=0;
     for(const sh of all){
       if(!sh || !sh.id) continue;
-      const existing = db.documents.find(d=>d.type==='bl' && d.dolibarrId===String(sh.id));
+      // on retrouve d'abord le colis via l'ID Dolibarr déjà lié, sinon via le n° de suivi
+      // (cas d'un colis créé/scanné ici avant d'être poussé côté Dolibarr) pour éviter les doublons.
+      let existing = db.documents.find(d=>d.type==='bl' && d.dolibarrId===String(sh.id));
+      if(!existing && sh.tracking_number){
+        existing = db.documents.find(d=>d.type==='bl' && !d.dolibarrId && d.numeroSuivi && d.numeroSuivi===sh.tracking_number);
+      }
       const c = sh.socid ? db.contacts.find(c=>c.dolibarrId===String(sh.socid)) : null;
       const { date: dateLivPrevue } = dolUnixToISO(sh.date_delivery || sh.date_shipping || sh.date_creation);
       const shLines = (Array.isArray(sh.lines) ? sh.lines : []).map(l=>({
@@ -2831,6 +2875,14 @@ async function syncDolibarrShipmentsPull(){
       }));
 
       if(existing){
+        if(!existing.dolibarrId){
+          // lien établi via le n° de suivi : on l'enregistre pour que les prochaines synchros
+          // matchent directement par ID Dolibarr.
+          existing.dolibarrId = String(sh.id);
+          existing.dolibarrRef = sh.ref || String(sh.id);
+          updated++;
+          dolLog('ok', `${existing.number} : lié à l'expédition Dolibarr ${sh.ref||sh.id} via le n° de suivi ${sh.tracking_number}.`);
+        }
         // on ne réimporte pas par-dessus une livraison déjà finalisée localement (livrée, refusée ou absent)
         if(!['paye','refuse','absent'].includes(existing.status)){
           if(sh.tracking_number && sh.tracking_number!==existing.numeroSuivi){ existing.numeroSuivi = sh.tracking_number; updated++; }
