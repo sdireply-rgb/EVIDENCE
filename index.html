@@ -2606,6 +2606,23 @@ async function syncDolibarrMorning(dateISO){
     if(all.length && !list.length){
       dolLog('info', `${all.length} événement(s) trouvé(s) autour du ${dateISO} mais aucun exactement ce jour-là après recalage horaire — vérifie l'heure du serveur Dolibarr si ça se reproduit.`);
     }
+    if(all.length===0){
+      // Diagnostic : la requête filtrée ne renvoie rien. On tente un appel sans aucun filtre de date
+      // pour savoir si c'est (a) un vrai "pas de RDV ce jour-là", ou (b) un souci de droits/filtre —
+      // dans ce cas l'API répond 200 avec un tableau vide au lieu d'une erreur, donc rien ne s'affichait avant.
+      try{
+        const probe = await dolFetch(`/agendaevents?limit=5&sortfield=t.datep&sortorder=DESC`);
+        const probeArr = Array.isArray(probe) ? probe : [];
+        if(probeArr.length===0){
+          dolLog('info', `Diagnostic : l'API Dolibarr ne renvoie AUCUN événement d'agenda, même sans filtre de date. Cause la plus probable : le compte/clé API utilisé n'a pas le droit "Agenda → Lire tous les agendas" (ou "Lire ses propres agendas" s'il n'a aucun RDV assigné), ou le module Agenda n'est pas activé côté Dolibarr.`);
+        } else {
+          const sample = probeArr.slice(0,3).map(e=>`#${e.id} "${e.label||''}" (datep=${e.datep})`).join(', ');
+          dolLog('info', `Diagnostic : l'API voit bien des événements (ex : ${sample}) mais aucun ne correspond au filtre de date du ${dateISO}. Vérifie que la date des RDV côté Dolibarr est bien celle attendue, et que le fuseau horaire du serveur Dolibarr correspond à celui attendu.`);
+        }
+      }catch(probeErr){
+        dolLog('info', `Diagnostic impossible (${probeErr.message}).`);
+      }
+    }
     let added = 0, skipped = 0;
     list.forEach(ev=>{
       const already = db.appointments.find(a=>a.dolibarrId===String(ev.id));
@@ -2682,6 +2699,7 @@ async function syncDolibarrContactsPush(){
 
 /* ---- Envoie un rendez-vous créé dans Evidence vers l'agenda Dolibarr (création OU mise à jour) ---- */
 async function pushAppointmentToDolibarr(r){
+  if(!db.dolibarr.rdvOwnerId) throw new Error(`ID utilisateur Dolibarr propriétaire des RDV non renseigné (Paramètres > Synchronisation Dolibarr).`);
   // date + heure du RDV -> timestamp unix attendu par l'API agendaevents
   const dateStr = `${r.date} ${r.heure||'09:00'}:00`;
   const datep = Math.floor(new Date(dateStr.replace(' ','T')).getTime()/1000);
@@ -2693,11 +2711,12 @@ async function pushAppointmentToDolibarr(r){
     catch(e){ dolLog('info', `RDV "${r.titre||r.objet}" : client non lié côté Dolibarr (${e.message}) — le RDV sera quand même créé, sans tiers associé.`); }
   }
   const body = {
-    label: r.titre || r.objet || 'RDV',
+    label: (r.titre || r.objet || '').trim() || 'RDV Evidence',
     datep: datep,
     percentage: r.status==='termine' ? 100 : (r.status==='annule' ? -1 : 0),
     note_public: r.notes || '',
-    code: 'AC_RDV'
+    code: 'AC_RDV',
+    userownerid: Number(db.dolibarr.rdvOwnerId)
   };
   if(socid) body.socid = Number(socid);
   if(r.duree){ body.datef = datep + Number(r.duree)*60; }
@@ -3964,6 +3983,16 @@ function renderSettings(){
         Les modules « Commandes » et « Expéditions » doivent aussi être activés côté Dolibarr.
       </div>
     </div>
+    <div class="field">
+      <label>ID utilisateur Dolibarr propriétaire des RDV</label>
+      <input id="dol_rdv_owner" type="number" placeholder="ex : 1" value="${escAttr(db.dolibarr.rdvOwnerId||'')}">
+      <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+        Obligatoire pour envoyer les rendez-vous vers Dolibarr : l'agenda Dolibarr exige qu'un événement soit
+        assigné à un utilisateur (champ « userownerid »). Trouve l'ID dans Dolibarr → Utilisateurs → fiche de
+        l'utilisateur (visible dans l'URL, ex : ...card.php?id=<b>1</b>) — utilise généralement le même
+        utilisateur que celui de la clé API.
+      </div>
+    </div>
     <div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap;">
       <button class="btn accent" id="saveDolBtn">Enregistrer la configuration Dolibarr</button>
       <button class="btn secondary" id="testDolBtn">⚡ Tester la connexion</button>
@@ -4061,6 +4090,7 @@ function bindSettings(){
     db.dolibarr.apiKey = val('dol_key').trim();
     db.dolibarr.autoCreateThirdParty = document.getElementById('dol_autocreate').checked;
     db.dolibarr.warehouseId = val('dol_warehouse').trim();
+    db.dolibarr.rdvOwnerId = val('dol_rdv_owner').trim();
     save();
     alert('Configuration Dolibarr enregistrée.');
   };
