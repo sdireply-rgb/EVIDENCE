@@ -2542,10 +2542,26 @@ async function dolFetch(path, options={}){
   return data;
 }
 function dolUnixToISO(ts){
-  // Dolibarr renvoie généralement des timestamps unix (secondes)
-  const n = typeof ts==='number' ? ts : parseInt(ts,10);
-  if(!n || isNaN(n)) return { date:null, heure:null };
-  const dt = new Date(n*1000);
+  // Selon la version/config de Dolibarr, l'API peut renvoyer soit un timestamp unix (nombre de
+  // secondes), soit directement une chaîne de date lisible ("2026-08-11 09:00:00" ou variantes ISO).
+  // On gère les deux cas : un mauvais parsing ici faisait passer certains RDV à la trappe silencieusement.
+  if(ts===null || ts===undefined || ts==='') return { date:null, heure:null };
+  let dt = null;
+  if(typeof ts==='number'){
+    dt = new Date(ts*1000);
+  } else if(typeof ts==='string'){
+    const trimmed = ts.trim();
+    if(/^-?\d+$/.test(trimmed)){
+      // chaîne purement numérique = timestamp unix envoyé sous forme de texte
+      dt = new Date(parseInt(trimmed,10)*1000);
+    } else {
+      // chaîne de date lisible ("2026-08-11 09:00:00", "2026-08-11T09:00:00", etc.)
+      const normalized = trimmed.includes('T') ? trimmed : trimmed.replace(' ', 'T');
+      dt = new Date(normalized);
+      if(isNaN(dt.getTime())) dt = new Date(trimmed); // dernier essai tel quel
+    }
+  }
+  if(!dt || isNaN(dt.getTime())) return { date:null, heure:null };
   const date = dt.toISOString().slice(0,10);
   const heure = dt.toTimeString().slice(0,5);
   return { date, heure };
@@ -2661,6 +2677,52 @@ async function syncDolibarrContactsPush(){
     try{ await ensureDolibarrThirdParty(c); created++; }
     catch(e){ fail++; dolLog('err', `Contact "${c.nom}" non créé côté Dolibarr (${e.message}).`); }
   }
+  return { created, fail };
+}
+
+/* ---- Envoie un rendez-vous créé dans Evidence vers l'agenda Dolibarr (création OU mise à jour) ---- */
+async function pushAppointmentToDolibarr(r){
+  // date + heure du RDV -> timestamp unix attendu par l'API agendaevents
+  const dateStr = `${r.date} ${r.heure||'09:00'}:00`;
+  const datep = Math.floor(new Date(dateStr.replace(' ','T')).getTime()/1000);
+  if(!datep || isNaN(datep)) throw new Error(`${r.titre||'RDV'} : date/heure invalide, envoi impossible.`);
+  let socid = null;
+  const contact = db.contacts.find(c=>c.id===r.contactId);
+  if(contact){
+    try{ socid = await ensureDolibarrThirdParty(contact); }
+    catch(e){ dolLog('info', `RDV "${r.titre||r.objet}" : client non lié côté Dolibarr (${e.message}) — le RDV sera quand même créé, sans tiers associé.`); }
+  }
+  const body = {
+    label: r.titre || r.objet || 'RDV',
+    datep: datep,
+    percentage: r.status==='termine' ? 100 : (r.status==='annule' ? -1 : 0),
+    note_public: r.notes || '',
+    code: 'AC_RDV'
+  };
+  if(socid) body.socid = Number(socid);
+  if(r.duree){ body.datef = datep + Number(r.duree)*60; }
+  if(r.dolibarrId){
+    // RDV déjà lié à Dolibarr : on met à jour l'événement existant plutôt que d'en recréer un
+    await dolFetch(`/agendaevents/${r.dolibarrId}`, { method:'PUT', body });
+    return r.dolibarrId;
+  }
+  const newId = await dolFetch('/agendaevents', { method:'POST', body });
+  r.dolibarrId = String(newId);
+  r.source = r.source || 'evidence';
+  r.dolibarrSynced = true;
+  r.dolibarrSyncedAt = new Date().toISOString();
+  return newId;
+}
+
+/* ---- Envoie vers Dolibarr tous les RDV créés localement dans Evidence et pas encore liés ---- */
+async function syncDolibarrAppointmentsPush(){
+  const candidates = db.appointments.filter(a=>a.source!=='dolibarr' && !a.dolibarrId);
+  let created=0, fail=0;
+  for(const a of candidates){
+    try{ await pushAppointmentToDolibarr(a); created++; }
+    catch(e){ fail++; dolLog('err', `RDV "${a.titre||a.objet||'sans titre'}" du ${a.date} non transféré vers Dolibarr (${e.message}).`); }
+  }
+  save();
   return { created, fail };
 }
 
@@ -3220,6 +3282,8 @@ async function syncDolibarrEvening(dateISO){
   const contactsPush = await syncDolibarrContactsPush().catch(e=>{ dolLog('err','Échec envoi des nouveaux contacts : '+e.message); return {created:0, fail:0}; });
   // 0bis) on pousse aussi les nouveaux produits/services créés localement et pas encore liés
   const productsPush = await syncDolibarrProductsPush().catch(e=>{ dolLog('err','Échec envoi des nouveaux produits/services : '+e.message); return {created:0, fail:0}; });
+  // 0ter) on pousse aussi les nouveaux rendez-vous créés localement dans Evidence et pas encore liés
+  const appointmentsPush = await syncDolibarrAppointmentsPush().catch(e=>{ dolLog('err','Échec envoi des nouveaux rendez-vous : '+e.message); return {created:0, fail:0}; });
   const devisFactures = db.documents.filter(d=>d.date===dateISO && (d.type==='devis'||d.type==='facture') && !d.dolibarrSynced);
   const bl = db.documents.filter(d=>d.date===dateISO && d.type==='bl' && !d.dolibarrSynced);
   const livraisonsAProuver = db.documents.filter(d=>d.type==='bl' && d.dolibarrId && ['paye','refuse','absent','reporte'].includes(d.status) && d.dolibarrLastPushedStatus!==d.status);
@@ -3257,8 +3321,8 @@ async function syncDolibarrEvening(dateISO){
   if(db.dolibarr.autoCreateThirdParty===undefined) db.dolibarr.autoCreateThirdParty = true;
   db.dolibarr.lastEveningSync = new Date().toISOString();
   save();
-  dolLog('info', `Synchro soir terminée : ${contactsPush.created} nouveau(x) contact(s) envoyé(s) vers Dolibarr, ${productsPush.created} nouveau(x) produit(s)/service(s) envoyé(s), ${ok} document(s)/contrat(s) transféré(s), ${fail} échec(s).`);
-  return { ok, fail, contactsPush, productsPush };
+  dolLog('info', `Synchro soir terminée : ${contactsPush.created} nouveau(x) contact(s) envoyé(s) vers Dolibarr, ${productsPush.created} nouveau(x) produit(s)/service(s) envoyé(s), ${appointmentsPush.created} rendez-vous envoyé(s), ${ok} document(s)/contrat(s) transféré(s), ${fail} échec(s).`);
+  return { ok, fail, contactsPush, productsPush, appointmentsPush };
 }
 
 /* ============================================================
@@ -3554,14 +3618,15 @@ function renderTicketZ(){
       prévus dans Dolibarr pour la date choisie ci-dessus (colonne « Du »), et <b>importe les nouveaux colis mis « en expédition »
       dans Dolibarr</b> comme livraisons à faire dans le module Livraison (transporteur, n° de suivi, adresse) — prêts à être
       livrés et signés depuis l'app, comme un transporteur classique.<br>
-      Soir : envoie automatiquement vers Dolibarr tout nouveau contact créé localement, transfère devis, factures, contrats
+      Soir : envoie automatiquement vers Dolibarr tout nouveau contact créé localement, tout nouveau rendez-vous créé dans Evidence,
+      transfère devis, factures, contrats
       (pièces jointes) et interventions non encore synchronisés de cette même date, <b>et dépose la signature client + la preuve
       de livraison</b> sur l'expédition Dolibarr dès qu'une livraison passe à « Livrée », « Refusée » ou « Reportée »
       (quelle que soit la date de la livraison — pas seulement celles du jour).
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;">
       <button class="btn secondary" id="zSyncMorningBtn">↓ Synchro matin (clients + produits + RDV + livraisons)</button>
-      <button class="btn secondary" id="zSyncEveningBtn">↑ Synchro soir (nouveaux contacts/produits + facture/devis/BL/contrat/intervention)</button>
+      <button class="btn secondary" id="zSyncEveningBtn">↑ Synchro soir (nouveaux contacts/produits/RDV + facture/devis/BL/contrat/intervention)</button>
       <button class="btn secondary small" id="zSyncContactsBtn">⇅ Synchro clients seule</button>
       <button class="btn secondary small" id="zSyncProductsBtn">⇅ Synchro produits/services seule</button>
     </div>
@@ -3643,7 +3708,7 @@ function bindTicketZ(){
     const btn = document.getElementById('zSyncEveningBtn'); btn.disabled = true; btn.textContent = 'Synchro en cours...';
     try{
       const r = await syncDolibarrEvening(ds);
-      alert(`Synchro soir terminée : ${r.contactsPush.created} nouveau(x) contact(s) envoyé(s), ${r.productsPush.created} nouveau(x) produit(s)/service(s) envoyé(s), ${r.ok} document(s)/contrat(s) transféré(s), ${r.fail} échec(s).`);
+      alert(`Synchro soir terminée : ${r.contactsPush.created} nouveau(x) contact(s) envoyé(s), ${r.productsPush.created} nouveau(x) produit(s)/service(s) envoyé(s), ${r.appointmentsPush.created} rendez-vous envoyé(s), ${r.ok} document(s)/contrat(s) transféré(s), ${r.fail} échec(s).`);
     }
     catch(e){ alert('Erreur synchro soir : '+e.message); }
     render();
