@@ -394,7 +394,7 @@ function load(){
     interventions:[],
     ticketsZ:[],
     counters:{ devis:0, facture:0, bl:0, contrat:0, intervention:0, ticketz:0 },
-    dolibarr:{ url:'', apiKey:'', autoCreateThirdParty:true, lastMorningSync:null, lastEveningSync:null, lastCompanySync:null, lastCompanyError:null, log:[] }
+    dolibarr:{ url:'', apiKey:'', autoCreateThirdParty:true, lastMorningSync:null, lastEveningSync:null, lastCompanySync:null, lastCompanyError:null, paymentModeId:'', bankAccountId:'', log:[] }
   };
 }
 // migration pour bases existantes créées avant les modules Contrats / RDV / Interventions / Ticket Z / Dolibarr
@@ -414,6 +414,8 @@ if(!('lastProductsSync' in db.dolibarr)) db.dolibarr.lastProductsSync = null;
 if(!('lastInvoicesPull' in db.dolibarr)) db.dolibarr.lastInvoicesPull = null;
 if(!('lastProposalsPull' in db.dolibarr)) db.dolibarr.lastProposalsPull = null;
 if(!('lastAppointmentsPull' in db.dolibarr)) db.dolibarr.lastAppointmentsPull = null;
+if(!('paymentModeId' in db.dolibarr)) db.dolibarr.paymentModeId = '';
+if(!('bankAccountId' in db.dolibarr)) db.dolibarr.bankAccountId = '';
 
 function save(){
   try{
@@ -2089,12 +2091,31 @@ function openAppointmentModal(id){
   document.getElementById('cancelBtn').onclick = closeModal;
   if(existing) document.getElementById('delBtn').onclick = ()=>{ db.appointments = db.appointments.filter(x=>x.id!==id); save(); closeModal(); render(); };
   function buildObj(){
-    return { id:r.id, contactId: val('r_contact'), date: val('r_date'), heure: val('r_heure'), duree: parseInt(val('r_duree'))||30, objet: val('r_objet'), lieu: val('r_lieu'), status: val('r_status'), notes: val('r_notes') };
+    return { id:r.id, contactId: val('r_contact'), date: val('r_date'), heure: val('r_heure'), duree: parseInt(val('r_duree'))||30, objet: val('r_objet'), lieu: val('r_lieu'), status: val('r_status'), notes: val('r_notes'),
+      // on conserve le lien Dolibarr existant (source, id, infos de synchro) : sans ça, éditer un RDV
+      // importé de Dolibarr le transformait en "nouveau RDV local" et le faisait renvoyer en double.
+      source: r.source, dolibarrId: r.dolibarrId, dolibarrSynced: r.dolibarrSynced, dolibarrSyncedAt: r.dolibarrSyncedAt };
   }
   document.getElementById('icsBtn').onclick = ()=> exportAppointmentIcs(buildObj());
-  document.getElementById('saveBtn').onclick = ()=>{
+  document.getElementById('saveBtn').onclick = async ()=>{
     const obj = buildObj();
     if(!obj.date){ alert('La date est requise.'); return; }
+    if(obj.status==='termine'){
+      // Un RDV marqué "Terminé" ne doit plus vivre dans Evidence : on l'envoie (ou on le met à jour)
+      // vers Dolibarr, puis on le retire d'ici — il reste consultable uniquement dans l'agenda Dolibarr.
+      const btn = document.getElementById('saveBtn'); btn.disabled = true; btn.textContent = 'Envoi vers Dolibarr...';
+      try{
+        await pushAppointmentToDolibarr(obj);
+        db.appointments = db.appointments.filter(x=>x.id!==obj.id);
+        save(); closeModal(); render();
+        return;
+      }catch(e){
+        alert(`RDV marqué terminé mais impossible de le transférer vers Dolibarr (${e.message}). Il reste visible dans Evidence en attendant ; réessaie une fois le souci résolu (ou relance la Synchro soir).`);
+        btn.disabled = false; btn.textContent = 'Enregistrer';
+        // on l'enregistre quand même localement avec le statut "terminé" pour ne rien perdre,
+        // la synchro soir le retentera et le retirera dès que l'envoi réussira.
+      }
+    }
     const idx = db.appointments.findIndex(x=>x.id===obj.id);
     if(idx>=0) db.appointments[idx]=obj; else db.appointments.push(obj);
     save(); closeModal(); render();
@@ -2551,7 +2572,17 @@ function dolUnixToISO(ts){
     dt = new Date(ts*1000);
   } else if(typeof ts==='string'){
     const trimmed = ts.trim();
-    if(/^-?\d+$/.test(trimmed)){
+    if(/^\d{14}$/.test(trimmed)){
+      // format compact "YYYYMMDDHHMMSS" que Dolibarr renvoie parfois selon la config
+      // (ex: "20260811090000") — à ne pas confondre avec un timestamp unix.
+      const y=trimmed.slice(0,4), mo=trimmed.slice(4,6), d=trimmed.slice(6,8),
+            h=trimmed.slice(8,10), mi=trimmed.slice(10,12), s=trimmed.slice(12,14);
+      dt = new Date(`${y}-${mo}-${d}T${h}:${mi}:${s}`);
+    } else if(/^\d{8}$/.test(trimmed)){
+      // format compact "YYYYMMDD" (date seule, sans heure)
+      const y=trimmed.slice(0,4), mo=trimmed.slice(4,6), d=trimmed.slice(6,8);
+      dt = new Date(`${y}-${mo}-${d}T00:00:00`);
+    } else if(/^-?\d+$/.test(trimmed)){
       // chaîne purement numérique = timestamp unix envoyé sous forme de texte
       dt = new Date(parseInt(trimmed,10)*1000);
     } else {
@@ -2567,6 +2598,60 @@ function dolUnixToISO(ts){
   return { date, heure };
 }
 
+/* ---- Détecte les événements d'agenda générés automatiquement par Dolibarr (facture validée,
+   paiement, commande créée, etc.) pour ne pas les importer comme s'il s'agissait de vrais
+   rendez-vous. Deux niveaux de filtre :
+   1) le "code" de l'événement (nom de champ variable selon la version de l'API Dolibarr, donc on
+      va le chercher à plusieurs endroits possibles) ;
+   2) un filet de sécurité par mots-clés dans le libellé, au cas où le code ne serait pas exploitable
+      tel quel (c'était le cas ici : tout remontait comme RDV, signe que le code n'était pas détecté). ---- */
+function getAgendaEventCode(ev){
+  if(!ev) return '';
+  const candidates = [ev.code, ev.type_code, ev.acode, ev.elementtype,
+    ev.type && (ev.type.code || ev.type.id), ev.actioncode];
+  const found = candidates.find(c=>c!==undefined && c!==null && String(c).trim()!=='');
+  return found ? String(found).toUpperCase() : '';
+}
+function isSystemGeneratedAgendaEvent(ev){
+  const label = (ev && (ev.label||ev.title||'')) ? String(ev.label||ev.title).toLowerCase() : '';
+  // Mots-clés "objet Dolibarr" : quasiment jamais présents dans le libellé d'un vrai RDV client
+  const objectKeywords = ['facture','paiement','payment','invoice','commande','devis','proposition',
+    'expédition','expedition','contrat','ticket','projet','avoir','règlement','reglement',
+    'prélèvement','prelevement','virement','tiers','third party','fournisseur','abonnement',
+    'relance','société','societe','entreprise cliente'];
+  // Verbes/actions typiques des journaux automatiques Dolibarr, quel que soit l'objet concerné
+  const actionKeywords = ['créé','créée','cree','creee','modifié','modifiée','modifie','modifiee',
+    'supprimé','supprimée','supprime','supprimee','validé','validée','valide','validee',
+    'clôturé','clôturée','cloture','cloturee','envoyé par','envoyee par','envoyé(e)',
+    'classé','classée','classe','classee','annulé','annulée','annule','annulee',
+    'a été','a ete','changement de statut','statut chang'];
+  if(objectKeywords.some(k=>label.includes(k))) return true;
+  if(actionKeywords.some(k=>label.includes(k))) return true;
+  const customKeywords = (db.dolibarr.excludeKeywords||'').split(',').map(k=>k.trim().toLowerCase()).filter(Boolean);
+  if(customKeywords.some(k=>label.includes(k))) return true;
+  const code = getAgendaEventCode(ev);
+  if(!code) return false; // ni code ni mot-clé suspect = événement manuel classique, on le garde
+  const systemPrefixes = ['AC_FAC','AC_COM','AC_PROP','AC_SHIP','AC_ORDER','AC_CONTRACT','AC_TASK','AC_TICKET','AC_PROJET','AC_EXPENSE','AC_SO_','AC_PAY'];
+  if(code==='AC_OTH_AUTO') return true; // action automatique système générique
+  return systemPrefixes.some(p=>code.startsWith(p));
+}
+/* ---- Liste blanche : ne retient QUE les vrais RDV clients, plutôt que d'essayer d'exclure tous
+   les types d'événements système possibles un par un (liste noire trop fragile — les libellés et
+   codes varient selon les versions Dolibarr, et un événement système mal reconnu remontait alors
+   comme un "RDV"). On n'accepte un événement que si :
+   1) son filet de sécurité mots-clés/préfixes ne l'a pas déjà signalé comme automatique, ET
+   2) son type est explicitement "Rendez-vous" (code AC_RDV) quand ce type est identifiable, OU,
+      si le type n'est pas exploitable dans la réponse API, qu'il est au moins lié à un tiers
+      (ev.socid) — un vrai RDV client est presque toujours rattaché à un tiers, contrairement à un
+      événement système générique. ---- */
+function isRealClientAppointment(ev){
+  if(!ev) return false;
+  if(isSystemGeneratedAgendaEvent(ev)) return false;
+  const code = getAgendaEventCode(ev);
+  if(code) return code === 'AC_RDV';
+  return !!ev.socid;
+}
+
 /* ---- Matin : import des RDV Dolibarr du jour + synchro des clients Dolibarr ---- */
 async function syncDolibarrMorning(dateISO){
   dateISO = dateISO || todayISO();
@@ -2578,55 +2663,84 @@ async function syncDolibarrMorning(dateISO){
   const productsResult = await syncDolibarrProducts().catch(e=>({ added:0, updated:0, error:e.message }));
   // 2) on importe les nouveaux colis mis "en expédition" côté Dolibarr, et on rafraîchit ceux déjà connus
   const shipmentsResult = await syncDolibarrShipmentsPull().catch(e=>({ added:0, updated:0, error:e.message }));
+  // 2bis) on importe les fiches d'intervention créées côté Dolibarr (sens qui manquait totalement
+  // jusqu'ici : seul l'envoi Evidence → Dolibarr existait, voir pushInterventionToDolibarr).
+  const interventionsResult = await syncDolibarrInterventionsPull().catch(e=>({ added:0, updated:0, error:e.message }));
   dolLog('info', `Synchro matin — recherche des RDV Dolibarr du ${dateISO}...`);
   try{
-    // On élargit volontairement la fenêtre d'un jour de chaque côté (le serveur Dolibarr peut être
-    // dans un fuseau horaire différent de celui du navigateur) : sans cette marge, un RDV posé en
-    // toute fin/début de journée peut tomber juste hors de la fenêtre stricte 00:00–23:59 et
-    // "disparaître" de la synchro. On filtre ensuite précisément côté client sur la vraie date locale.
+    // IMPORTANT : on n'utilise plus de filtre serveur (sqlfilters) sur t.datep pour interroger
+    // /agendaevents. Ce filtre s'est avéré peu fiable selon les installs Dolibarr (retourne un
+    // tableau vide, sans erreur HTTP, même quand de vrais RDV existent dans la fenêtre demandée —
+    // probablement un souci de format/alias de champ côté API). On reproduit donc exactement la
+    // méthode de l'import historique (syncDolibarrAppointmentsPull), qui elle fonctionne bien :
+    // récupération SANS filtre serveur, tri décroissant par id (les RDV les plus récents/proches
+    // en premier), puis filtrage de la fenêtre de dates côté client.
     const prevISO = new Date(new Date(dateISO+'T00:00:00').getTime() - 86400000).toISOString().slice(0,10);
-    const nextISO = new Date(new Date(dateISO+'T00:00:00').getTime() + 86400000).toISOString().slice(0,10);
-    const filt = encodeURIComponent(`(t.datep:>=:'${prevISO} 00:00:00') and (t.datep:<=:'${nextISO} 23:59:59')`);
     let all = [];
     let page = 0;
     const limit = 200;
     while(true){
-      const batch = await dolFetch(`/agendaevents?sqlfilters=${filt}&sortfield=t.datep&sortorder=ASC&limit=${limit}&page=${page}`);
+      const batch = await dolFetch(`/agendaevents?sortfield=t.id&sortorder=DESC&limit=${limit}&page=${page}`);
       const arr = Array.isArray(batch) ? batch : [];
-      all = all.concat(arr);
+      if(arr.length===0) break;
+      const inWindow = arr.filter(ev=>{
+        const { date } = dolUnixToISO(ev.datep);
+        // Pas de borne supérieure : on veut aussi les RDV créés pour dans plusieurs jours/semaines,
+        // pas seulement ceux d'aujourd'hui/demain — sinon un nouveau RDV posé pour la semaine
+        // prochaine n'apparaît jamais tant que sa date n'est pas "demain". Seule la borne du bas
+        // (hier) reste, comme marge de sécurité fuseau horaire.
+        return date && date>=prevISO;
+      });
+      all = all.concat(inWindow);
+      // Comme on trie du plus récent au plus ancien par id (pas par date), on ne peut pas déduire
+      // avec certitude qu'on a dépassé la fenêtre juste parce qu'une page n'en contient aucun —
+      // un RDV ancien peut avoir été créé/modifié récemment (id élevé) avec une date passée. On
+      // limite donc simplement le nombre de pages parcourues, comme le fait l'import historique.
       if(arr.length < limit) break;
       page++;
       if(page>20) break; // sécurité anti-boucle
     }
-    // filtre client-side précis sur la date locale réelle du RDV, pour ne garder que ceux du jour demandé
-    const list = all.filter(ev=>{
-      const { date } = dolUnixToISO(ev.datep);
-      return date === dateISO;
-    });
-    if(all.length && !list.length){
-      dolLog('info', `${all.length} événement(s) trouvé(s) autour du ${dateISO} mais aucun exactement ce jour-là après recalage horaire — vérifie l'heure du serveur Dolibarr si ça se reproduit.`);
+    const excluded = all.filter(ev=>!isRealClientAppointment(ev));
+    const list = all.filter(ev=>isRealClientAppointment(ev));
+    if(excluded.length){
+      const sample = excluded.slice(0,5).map(e=>`"${e.label||''}" (code détecté: ${getAgendaEventCode(e)||'aucun'})`).join(', ');
+      dolLog('info', `${excluded.length} événement(s) depuis le ${prevISO} exclu(s) car reconnu(s) comme automatique(s)/non-RDV : ${sample}${excluded.length>5?'…':''}. Si un vrai RDV a été exclu par erreur, dis-moi son libellé exact.`);
+    }
+    if(all.length){
+      const rawSample = all.slice(0,3).map(e=>`datep brut="${e.datep}" → interprété comme "${dolUnixToISO(e.datep).date||'?'}"`).join(' | ');
+      dolLog('info', `${all.length} événement(s) trouvé(s) depuis le ${prevISO} (hier + tous les RDV à venir, sans limite de date future), ${list.length} retenu(s) comme vrai(s) RDV. Échantillon : ${rawSample}`);
     }
     if(all.length===0){
-      // Diagnostic : la requête filtrée ne renvoie rien. On tente un appel sans aucun filtre de date
-      // pour savoir si c'est (a) un vrai "pas de RDV ce jour-là", ou (b) un souci de droits/filtre —
-      // dans ce cas l'API répond 200 avec un tableau vide au lieu d'une erreur, donc rien ne s'affichait avant.
+      // Diagnostic : même sans filtre serveur, rien trouvé dans la fenêtre de dates. On tente un
+      // appel de contrôle pour savoir si c'est (a) un vrai "pas de RDV ce jour-là", ou (b) un souci
+      // de droits qui bloquerait toute lecture de l'agenda.
       try{
-        const probe = await dolFetch(`/agendaevents?limit=5&sortfield=t.datep&sortorder=DESC`);
+        const probe = await dolFetch(`/agendaevents?limit=5&sortfield=t.id&sortorder=DESC`);
         const probeArr = Array.isArray(probe) ? probe : [];
         if(probeArr.length===0){
           dolLog('info', `Diagnostic : l'API Dolibarr ne renvoie AUCUN événement d'agenda, même sans filtre de date. Cause la plus probable : le compte/clé API utilisé n'a pas le droit "Agenda → Lire tous les agendas" (ou "Lire ses propres agendas" s'il n'a aucun RDV assigné), ou le module Agenda n'est pas activé côté Dolibarr.`);
         } else {
           const sample = probeArr.slice(0,3).map(e=>`#${e.id} "${e.label||''}" (datep=${e.datep})`).join(', ');
-          dolLog('info', `Diagnostic : l'API voit bien des événements (ex : ${sample}) mais aucun ne correspond au filtre de date du ${dateISO}. Vérifie que la date des RDV côté Dolibarr est bien celle attendue, et que le fuseau horaire du serveur Dolibarr correspond à celui attendu.`);
+          dolLog('info', `Diagnostic : l'API voit bien des événements (ex : ${sample}) mais aucun n'est daté du ${prevISO} ou après. Vérifie que la date des RDV côté Dolibarr est bien celle attendue, et que le fuseau horaire du serveur Dolibarr correspond à celui attendu. Augmente éventuellement le nombre de pages parcourues (variable page>20) si tu as beaucoup d'événements récents non liés à des RDV.`);
         }
       }catch(probeErr){
         dolLog('info', `Diagnostic impossible (${probeErr.message}).`);
       }
     }
-    let added = 0, skipped = 0;
+    let added = 0, skipped = 0, removedDone = 0;
     list.forEach(ev=>{
       const already = db.appointments.find(a=>a.dolibarrId===String(ev.id));
-      if(already){ skipped++; return; }
+      const isDone = ev.percentage>=100;
+      if(already){
+        // Un RDV déjà importé qui vient d'être marqué "fait" côté Dolibarr : on ne le garde plus
+        // dans Evidence, il reste consultable uniquement dans l'agenda Dolibarr.
+        if(isDone){ db.appointments = db.appointments.filter(a=>a.id!==already.id); removedDone++; }
+        else{ skipped++; }
+        return;
+      }
+      // Un RDV déjà terminé côté Dolibarr au moment où on le découvre : inutile de l'importer dans
+      // Evidence pour l'en ressortir aussitôt, on ne veut voir ici que les RDV encore actifs.
+      if(isDone){ removedDone++; return; }
       const { date, heure } = dolUnixToISO(ev.datep);
       let contactId = '';
       if(ev.socid){
@@ -2646,15 +2760,15 @@ async function syncDolibarrMorning(dateISO){
         titre: ev.label || 'RDV Dolibarr',
         lieu: '',
         notes: ev.note_public || ev.note_private || '',
-        status: ev.percentage>=100 ? 'termine' : 'planifie'
+        status: 'planifie'
       });
       added++;
     });
     save();
     db.dolibarr.lastMorningSync = new Date().toISOString();
     save();
-    dolLog('ok', `Synchro matin terminée : ${added} RDV importé(s), ${skipped} déjà présent(s).`);
-    return { added, skipped, contacts: contactsResult, products: productsResult, shipments: shipmentsResult };
+    dolLog('ok', `Synchro matin terminée : ${added} RDV importé(s), ${skipped} déjà présent(s), ${removedDone} RDV terminé(s) retiré(s) d'Evidence (consultables uniquement dans Dolibarr).`);
+    return { added, skipped, contacts: contactsResult, products: productsResult, shipments: shipmentsResult, interventions: interventionsResult };
   }catch(e){
     dolLog('err', 'Échec synchro matin : '+e.message);
     throw e;
@@ -2715,7 +2829,7 @@ async function pushAppointmentToDolibarr(r){
     datep: datep,
     percentage: r.status==='termine' ? 100 : (r.status==='annule' ? -1 : 0),
     note_public: r.notes || '',
-    code: 'AC_RDV',
+    type_code: 'AC_RDV', // l'API Dolibarr attend "type_code" (et non "code") pour le type d'événement d'agenda
     userownerid: Number(db.dolibarr.rdvOwnerId)
   };
   if(socid) body.socid = Number(socid);
@@ -2735,14 +2849,23 @@ async function pushAppointmentToDolibarr(r){
 
 /* ---- Envoie vers Dolibarr tous les RDV créés localement dans Evidence et pas encore liés ---- */
 async function syncDolibarrAppointmentsPush(){
-  const candidates = db.appointments.filter(a=>a.source!=='dolibarr' && !a.dolibarrId);
+  const candidates = db.appointments.filter(a=>a.source!=='dolibarr' && !a.dolibarrId && a.status!=='termine');
   let created=0, fail=0;
   for(const a of candidates){
     try{ await pushAppointmentToDolibarr(a); created++; }
     catch(e){ fail++; dolLog('err', `RDV "${a.titre||a.objet||'sans titre'}" du ${a.date} non transféré vers Dolibarr (${e.message}).`); }
   }
+  // Rattrapage : tout RDV resté en local avec le statut "Terminé" (ex : la modale n'a pas pu le
+  // transférer tout de suite, souci réseau...) doit être envoyé/mis à jour côté Dolibarr puis retiré
+  // d'Evidence — un RDV terminé ne doit plus vivre ici, seulement dans l'agenda Dolibarr.
+  const doneLeftover = db.appointments.filter(a=>a.status==='termine');
+  let removedDone=0, doneFail=0;
+  for(const a of doneLeftover){
+    try{ await pushAppointmentToDolibarr(a); db.appointments = db.appointments.filter(x=>x.id!==a.id); removedDone++; }
+    catch(e){ doneFail++; dolLog('err', `RDV terminé "${a.titre||a.objet||'sans titre'}" du ${a.date} non transféré vers Dolibarr, il reste dans Evidence pour l'instant (${e.message}).`); }
+  }
   save();
-  return { created, fail };
+  return { created, fail, removedDone, doneFail };
 }
 
 /* ---- Soir : pousse un document (devis/facture) avec ses lignes ---- */
@@ -2809,6 +2932,49 @@ async function pushInterventionToDolibarr(it){
   it.dolibarrSyncedAt = new Date().toISOString();
   save();
   return newId;
+}
+
+/* ---- Soir : répercute sur Dolibarr le paiement d'une facture marquée "Payé" dans Evidence.
+   Sans ça, une facture créée puis payée dans Evidence restait indéfiniment "impayée" côté
+   Dolibarr, car pushDocToDolibarr ne fait que créer/valider la facture une seule fois — il ne
+   renvoie jamais les changements de statut ultérieurs. On enregistre ici un vrai règlement
+   Dolibarr (endpoint /invoices/{id}/payments), ce qui exige un mode de paiement et un compte
+   bancaire Dolibarr valides (configurables dans Paramètres > Synchronisation Dolibarr). ---- */
+async function pushInvoicePaymentToDolibarr(d){
+  if(!d.dolibarrId) throw new Error(`${d.number} : facture non encore transférée vers Dolibarr, impossible d'y déposer un règlement.`);
+  if(!db.dolibarr.paymentModeId) throw new Error(`${d.number} : ID du mode de paiement Dolibarr non renseigné (Paramètres > Synchronisation Dolibarr).`);
+  if(!db.dolibarr.bankAccountId) throw new Error(`${d.number} : ID du compte bancaire Dolibarr non renseigné (Paramètres > Synchronisation Dolibarr).`);
+  // On vérifie d'abord l'état réel de la facture côté Dolibarr : si elle y est déjà soldée (reste à
+  // payer = 0), on ne tente pas d'y ajouter un règlement — Dolibarr refuse un paiement de 0€ avec
+  // l'erreur "TotalAmountEmpty". On se contente alors de marquer la synchro comme faite. Ce cas est
+  // fréquent pour les factures importées depuis l'historique Dolibarr, déjà payées avant même d'avoir
+  // été marquées "Payé" dans Evidence.
+  let remote;
+  try{ remote = await dolFetch(`/invoices/${d.dolibarrId}`); }
+  catch(e){
+    if(/not found/i.test(e.message)){
+      throw new Error(`${d.number} : la facture liée (id Dolibarr ${d.dolibarrId}) n'existe plus/pas côté Dolibarr — lien de synchro invalide. Vérifie côté Dolibarr, ou supprime puis renvoie cette facture pour la relier à une nouvelle.`);
+    }
+    throw e;
+  }
+  const alreadyPaid = Number(remote.paye)===1 || Number(remote.statut)===2;
+  if(alreadyPaid){
+    d.dolibarrLastPushedStatus = d.status;
+    d.dolibarrPaymentSyncedAt = new Date().toISOString();
+    save();
+    return { alreadyPaid: true };
+  }
+  const body = {
+    datepaye: Math.floor(Date.now()/1000),
+    paymentid: Number(db.dolibarr.paymentModeId),
+    closepaidinvoices: 'yes',
+    accountid: Number(db.dolibarr.bankAccountId)
+  };
+  await dolFetch(`/invoices/${d.dolibarrId}/payments`, { method:'POST', body });
+  d.dolibarrLastPushedStatus = d.status;
+  d.dolibarrPaymentSyncedAt = new Date().toISOString();
+  save();
+  return { alreadyPaid: false };
 }
 
 /* ---- Soir : pousse un bon de livraison ----
@@ -3084,6 +3250,83 @@ async function syncDolibarrShipmentsPull(){
   }
 }
 
+/* ---- Interventions : import des fiches d'intervention créées côté Dolibarr (agents, autre
+   utilisateur, mobile Dolibarr, etc.) vers Evidence. Symétrique de pushInterventionToDolibarr,
+   qui ne fait que l'envoi Evidence → Dolibarr et ne remonte donc jamais ce qui est créé côté
+   Dolibarr — d'où l'absence totale d'import observée jusqu'ici. ---- */
+async function syncDolibarrInterventionsPull(){
+  dolLog('info', `Synchro interventions — récupération des fiches Dolibarr...`);
+  try{
+    let all = [];
+    let page = 0;
+    const limit = 200;
+    while(true){
+      const batch = await dolFetch(`/interventions?sortfield=t.rowid&sortorder=DESC&limit=${limit}&page=${page}`);
+      const arr = Array.isArray(batch) ? batch : [];
+      all = all.concat(arr);
+      if(arr.length < limit) break;
+      page++;
+      if(page>20) break; // sécurité anti-boucle
+    }
+    let added=0, updated=0;
+    for(const fi of all){
+      if(!fi || !fi.id) continue;
+      const existing = db.interventions.find(i=>i.dolibarrId===String(fi.id));
+      const c = fi.socid ? db.contacts.find(c=>c.dolibarrId===String(fi.socid)) : null;
+      const { date } = dolUnixToISO(fi.date_create || fi.datec || fi.date);
+      // Durée : on additionne la durée (en secondes) de toutes les lignes de la fiche, si présentes.
+      const fiLines = Array.isArray(fi.lines) ? fi.lines : [];
+      const dureeSec = fiLines.reduce((s,l)=> s + (Number(l.duration)||0), 0);
+      const dureeHeures = dureeSec ? Math.round((dureeSec/3600)*100)/100 : (Number(fi.duration)||0)/3600 || 0;
+      const linesMapped = fiLines.map(l=>({
+        desc: l.desc || l.description || 'Prestation', qty:1, price:0, tva:0
+      }));
+
+      if(existing){
+        // on ne réimporte pas par-dessus une intervention déjà terminée localement, pour ne pas
+        // écraser les photos/signature/notes déjà saisies sur le terrain.
+        if(existing.status==='terminee') continue;
+        let changed = false;
+        if(fi.ref && fi.ref!==existing.dolibarrRef){ existing.dolibarrRef = fi.ref; changed = true; }
+        if(fi.note_public && fi.note_public!==existing.notes){ existing.notes = fi.note_public; changed = true; }
+        if(changed){ updated++; }
+        continue;
+      }
+
+      const it = {
+        id: uid(),
+        number: fi.ref || interventionNextNumber(),
+        contactId: c ? c.id : '',
+        date: date || todayISO(),
+        heure: '09:00',
+        technicien: fi.fk_user_author_name || fi.user_author || '',
+        description: fi.description || fi.note_private || (fi.ref ? 'Intervention '+fi.ref : 'Intervention Dolibarr'),
+        dureeHeures: dureeHeures || 0,
+        status: fi.statut>=2 ? 'terminee' : 'planifiee',
+        notes: fi.note_public || '',
+        lines: linesMapped,
+        photos:{ avant:[], apres:[] },
+        signatureClient: null,
+        source: 'dolibarr',
+        dolibarrId: String(fi.id),
+        dolibarrRef: fi.ref || String(fi.id),
+        dolibarrSynced: true,
+        dolibarrSyncedAt: new Date().toISOString()
+      };
+      db.interventions.push(it);
+      added++;
+    }
+    save();
+    db.dolibarr.lastInterventionsPull = new Date().toISOString();
+    save();
+    dolLog('ok', `Synchro interventions terminée : ${added} nouvelle(s) intervention(s) importée(s), ${updated} mise(s) à jour.`);
+    return { added, updated };
+  }catch(e){
+    dolLog('err', 'Échec synchro interventions : '+e.message);
+    throw e;
+  }
+}
+
 function dataUrlToBase64(dataUrl){
   if(!dataUrl) return null;
   const idx = dataUrl.indexOf(',');
@@ -3306,6 +3549,7 @@ async function syncDolibarrEvening(dateISO){
   const devisFactures = db.documents.filter(d=>d.date===dateISO && (d.type==='devis'||d.type==='facture') && !d.dolibarrSynced);
   const bl = db.documents.filter(d=>d.date===dateISO && d.type==='bl' && !d.dolibarrSynced);
   const livraisonsAProuver = db.documents.filter(d=>d.type==='bl' && d.dolibarrId && ['paye','refuse','absent','reporte'].includes(d.status) && d.dolibarrLastPushedStatus!==d.status);
+  const facturesAPayer = db.documents.filter(d=>d.type==='facture' && d.dolibarrId && d.status==='paye' && d.dolibarrLastPushedStatus!=='paye');
   const interventions = db.interventions.filter(it=>it.date===dateISO && !it.dolibarrSynced);
   const contrats = db.contracts.filter(c=>c.date===dateISO && !c.dolibarrSynced);
   let ok=0, fail=0;
@@ -3326,6 +3570,14 @@ async function syncDolibarrEvening(dateISO){
     }
     catch(e){ dolLog('err', `${d.number} : ${e.message}`); fail++; }
   }
+  for(const d of facturesAPayer){
+    try{
+      const r = await pushInvoicePaymentToDolibarr(d);
+      dolLog('ok', r.alreadyPaid ? `${d.number} : déjà soldée côté Dolibarr, synchro juste marquée à jour.` : `${d.number} : règlement déposé sur Dolibarr, facture marquée payée.`);
+      ok++;
+    }
+    catch(e){ dolLog('err', `${d.number} : ${e.message}`); fail++; }
+  }
   for(const it of interventions){
     try{ await pushInterventionToDolibarr(it); dolLog('ok', `${it.number} transférée vers Dolibarr.`); ok++; }
     catch(e){ dolLog('err', `${it.number} : ${e.message}`); fail++; }
@@ -3340,7 +3592,7 @@ async function syncDolibarrEvening(dateISO){
   if(db.dolibarr.autoCreateThirdParty===undefined) db.dolibarr.autoCreateThirdParty = true;
   db.dolibarr.lastEveningSync = new Date().toISOString();
   save();
-  dolLog('info', `Synchro soir terminée : ${contactsPush.created} nouveau(x) contact(s) envoyé(s) vers Dolibarr, ${productsPush.created} nouveau(x) produit(s)/service(s) envoyé(s), ${appointmentsPush.created} rendez-vous envoyé(s), ${ok} document(s)/contrat(s) transféré(s), ${fail} échec(s).`);
+  dolLog('info', `Synchro soir terminée : ${contactsPush.created} nouveau(x) contact(s) envoyé(s) vers Dolibarr, ${productsPush.created} nouveau(x) produit(s)/service(s) envoyé(s), ${appointmentsPush.created} rendez-vous envoyé(s), ${appointmentsPush.removedDone||0} RDV terminé(s) retiré(s) d'Evidence, ${ok} document(s)/contrat(s) transféré(s), ${fail} échec(s).`);
   return { ok, fail, contactsPush, productsPush, appointmentsPush };
 }
 
@@ -3476,18 +3728,28 @@ async function syncDolibarrAppointmentsPull(){
     let page = 0;
     const limit = 200;
     while(true){
-      const batch = await dolFetch(`/agendaevents?sortfield=t.datep&sortorder=ASC&limit=${limit}&page=${page}`);
+      const batch = await dolFetch(`/agendaevents?sortfield=t.id&sortorder=ASC&limit=${limit}&page=${page}`);
       const arr = Array.isArray(batch) ? batch : [];
       all = all.concat(arr);
       if(arr.length < limit) break;
       page++;
       if(page>300) break; // sécurité anti-boucle
     }
-    let added=0, skipped=0;
+    let added=0, skipped=0, removedDone=0;
     all.forEach(ev=>{
       if(!ev || !ev.id) return;
+      if(!isRealClientAppointment(ev)) return; // on ne garde que les vrais RDV clients (type AC_RDV / lié à un tiers), pas les événements système (facture validée, etc.)
+      const isDone = ev.percentage>=100;
       const already = db.appointments.find(a=>a.dolibarrId===String(ev.id));
-      if(already){ skipped++; return; }
+      if(already){
+        // RDV déjà présent en local mais marqué terminé côté Dolibarr depuis : on le retire d'Evidence,
+        // il reste consultable uniquement dans l'agenda Dolibarr.
+        if(isDone){ db.appointments = db.appointments.filter(a=>a.id!==already.id); removedDone++; }
+        else{ skipped++; }
+        return;
+      }
+      // On n'importe pas les RDV déjà terminés côté Dolibarr : Evidence ne doit contenir que les RDV actifs.
+      if(isDone){ removedDone++; return; }
       const { date, heure } = dolUnixToISO(ev.datep);
       let contactId = '';
       if(ev.socid){
@@ -3507,15 +3769,15 @@ async function syncDolibarrAppointmentsPull(){
         titre: ev.label || 'RDV Dolibarr',
         lieu: '',
         notes: ev.note_public || ev.note_private || '',
-        status: ev.percentage>=100 ? 'termine' : 'planifie'
+        status: 'planifie'
       });
       added++;
     });
     save();
     db.dolibarr.lastAppointmentsPull = new Date().toISOString();
     save();
-    dolLog('ok', `Import historique RDV terminé : ${added} nouveau(x) RDV importé(s), ${skipped} déjà présent(s) (${all.length} RDV trouvé(s) côté Dolibarr).`);
-    return { added, skipped, total: all.length };
+    dolLog('ok', `Import historique RDV terminé : ${added} nouveau(x) RDV importé(s), ${skipped} déjà présent(s), ${removedDone} terminé(s) retiré(s)/ignoré(s) d'Evidence (${all.length} RDV trouvé(s) côté Dolibarr).`);
+    return { added, skipped, removedDone, total: all.length };
   }catch(e){
     dolLog('err', 'Échec import historique RDV : '+e.message);
     throw e;
@@ -3644,7 +3906,7 @@ function renderTicketZ(){
       (quelle que soit la date de la livraison — pas seulement celles du jour).
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;">
-      <button class="btn secondary" id="zSyncMorningBtn">↓ Synchro matin (clients + produits + RDV + livraisons)</button>
+      <button class="btn secondary" id="zSyncMorningBtn">↓ Synchro matin (clients + produits + RDV + livraisons + interventions)</button>
       <button class="btn secondary" id="zSyncEveningBtn">↑ Synchro soir (nouveaux contacts/produits/RDV + facture/devis/BL/contrat/intervention)</button>
       <button class="btn secondary small" id="zSyncContactsBtn">⇅ Synchro clients seule</button>
       <button class="btn secondary small" id="zSyncProductsBtn">⇅ Synchro produits/services seule</button>
@@ -3681,7 +3943,8 @@ function renderTicketZ(){
     <div style="font-size:11.5px;color:var(--muted);margin-top:8px;">
       Dernier import factures : ${db.dolibarr.lastInvoicesPull? fmtDate(db.dolibarr.lastInvoicesPull) : '—'} ·
       Dernier import devis : ${db.dolibarr.lastProposalsPull? fmtDate(db.dolibarr.lastProposalsPull) : '—'} ·
-      Dernier import RDV (historique) : ${db.dolibarr.lastAppointmentsPull? fmtDate(db.dolibarr.lastAppointmentsPull) : '—'}
+      Dernier import RDV (historique) : ${db.dolibarr.lastAppointmentsPull? fmtDate(db.dolibarr.lastAppointmentsPull) : '—'} ·
+      Dernier import interventions : ${db.dolibarr.lastInterventionsPull? fmtDate(db.dolibarr.lastInterventionsPull) : '—'}
     </div>
   </div>`;
 }
@@ -3717,7 +3980,8 @@ function bindTicketZ(){
       const cinfo = r.contacts && !r.contacts.error ? `, ${r.contacts.added} client(s) créé(s) / ${r.contacts.updated} mis à jour` : '';
       const pinfo = r.products && !r.products.error ? `, ${r.products.added} produit(s)/service(s) créé(s) / ${r.products.updated} mis à jour` : '';
       const sinfo = r.shipments && !r.shipments.error ? `, ${r.shipments.added} nouvelle(s) livraison(s) importée(s)` : '';
-      alert(`Synchro matin terminée : ${r.added} RDV importé(s), ${r.skipped} déjà présent(s)${cinfo}${pinfo}${sinfo}.`);
+      const iinfo = r.interventions && !r.interventions.error ? `, ${r.interventions.added} intervention(s) importée(s) / ${r.interventions.updated} mise(s) à jour` : '';
+      alert(`Synchro matin terminée : ${r.added} RDV importé(s), ${r.skipped} déjà présent(s)${cinfo}${pinfo}${sinfo}${iinfo}.`);
     }
     catch(e){ alert('Erreur synchro matin : '+e.message); }
     render();
@@ -3993,6 +4257,31 @@ function renderSettings(){
         utilisateur que celui de la clé API.
       </div>
     </div>
+    <div class="field">
+      <label>ID mode de paiement Dolibarr (pour marquer les factures payées)</label>
+      <input id="dol_payment_mode" type="number" placeholder="ex : 3 (virement)" value="${escAttr(db.dolibarr.paymentModeId||'')}">
+      <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+        Obligatoire pour répercuter sur Dolibarr le paiement d'une facture marquée « Payé » dans Evidence.
+        Trouve l'ID dans Dolibarr → Configuration → Dictionnaires → Modes de règlement (survole ou clique une ligne, l'ID apparaît dans l'URL/le tableau).
+      </div>
+    </div>
+    <div class="field">
+      <label>ID compte bancaire Dolibarr (pour l'encaissement)</label>
+      <input id="dol_bank_account" type="number" placeholder="ex : 1" value="${escAttr(db.dolibarr.bankAccountId||'')}">
+      <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+        Obligatoire également pour répercuter le paiement : chaque règlement Dolibarr doit être rattaché à un compte
+        bancaire. Trouve l'ID dans Dolibarr → Banque → fiche du compte (visible dans l'URL, ex : ...card.php?id=<b>1</b>).
+      </div>
+    </div>
+    <div class="field">
+      <label>Mots à exclure de l'import des RDV (en plus des mots déjà exclus par défaut)</label>
+      <input id="dol_exclude_keywords" type="text" placeholder="ex : livraison, sms, newsletter" value="${escAttr(db.dolibarr.excludeKeywords||'')}">
+      <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+        Séparés par des virgules. Si un événement automatique Dolibarr (facture, tiers, paiement...) continue
+        d'être importé comme un RDV alors qu'il ne devrait pas, ajoute ici un mot présent dans son libellé
+        pour l'exclure à la prochaine synchro.
+      </div>
+    </div>
     <div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap;">
       <button class="btn accent" id="saveDolBtn">Enregistrer la configuration Dolibarr</button>
       <button class="btn secondary" id="testDolBtn">⚡ Tester la connexion</button>
@@ -4091,6 +4380,9 @@ function bindSettings(){
     db.dolibarr.autoCreateThirdParty = document.getElementById('dol_autocreate').checked;
     db.dolibarr.warehouseId = val('dol_warehouse').trim();
     db.dolibarr.rdvOwnerId = val('dol_rdv_owner').trim();
+    db.dolibarr.paymentModeId = val('dol_payment_mode').trim();
+    db.dolibarr.bankAccountId = val('dol_bank_account').trim();
+    db.dolibarr.excludeKeywords = val('dol_exclude_keywords').trim();
     save();
     alert('Configuration Dolibarr enregistrée.');
   };
