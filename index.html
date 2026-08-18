@@ -394,7 +394,7 @@ function load(){
     interventions:[],
     ticketsZ:[],
     counters:{ devis:0, facture:0, bl:0, contrat:0, intervention:0, ticketz:0 },
-    dolibarr:{ url:'', apiKey:'', autoCreateThirdParty:true, lastMorningSync:null, lastEveningSync:null, lastCompanySync:null, lastCompanyError:null, paymentModeId:'', bankAccountId:'', log:[] }
+    dolibarr:{ url:'', apiKey:'', autoCreateThirdParty:true, lastMorningSync:null, lastEveningSync:null, lastCompanySync:null, lastCompanyError:null, paymentModeId:'', bankAccountId:'', projectId:'', log:[] }
   };
 }
 // migration pour bases existantes créées avant les modules Contrats / RDV / Interventions / Ticket Z / Dolibarr
@@ -416,6 +416,7 @@ if(!('lastProposalsPull' in db.dolibarr)) db.dolibarr.lastProposalsPull = null;
 if(!('lastAppointmentsPull' in db.dolibarr)) db.dolibarr.lastAppointmentsPull = null;
 if(!('paymentModeId' in db.dolibarr)) db.dolibarr.paymentModeId = '';
 if(!('bankAccountId' in db.dolibarr)) db.dolibarr.bankAccountId = '';
+if(!('projectId' in db.dolibarr)) db.dolibarr.projectId = '';
 
 function save(){
   try{
@@ -2904,11 +2905,13 @@ async function pushDocToDolibarr(d){
 async function pushInterventionToDolibarr(it){
   const contact = db.contacts.find(c=>c.id===it.contactId);
   if(!contact) throw new Error(`${it.number} : aucun client associé, transfert impossible.`);
+  if(!db.dolibarr.projectId) throw new Error(`${it.number} : ID du projet Dolibarr non renseigné (Paramètres > Synchronisation Dolibarr) — obligatoire pour créer une fiche d'intervention (fk_project).`);
   const socid = await ensureDolibarrThirdParty(contact);
   const totals = interventionTotals(it);
   const detailLines = (it.lines||[]).map(l=>`- ${l.desc} x${l.qty} @ ${fmtMoney(l.price)}`).join('\n');
   const header = {
     socid: Number(socid),
+    fk_project: Number(db.dolibarr.projectId),
     date_create: Math.floor(new Date(it.date).getTime()/1000),
     description: [
       it.description||'',
@@ -4274,6 +4277,16 @@ function renderSettings(){
       </div>
     </div>
     <div class="field">
+      <label>ID projet Dolibarr par défaut (pour les interventions)</label>
+      <input id="dol_project" type="number" placeholder="ex : 1" value="${escAttr(db.dolibarr.projectId||'')}">
+      <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+        Obligatoire pour transférer les fiches d'intervention : l'API Dolibarr exige qu'une intervention
+        soit rattachée à un projet (champ « fk_project »), sinon la synchro échoue avec l'erreur
+        FI2603-0033. Trouve l'ID dans Dolibarr → Projets → fiche du projet (visible dans l'URL, ex :
+        ...card.php?id=<b>1</b>). Toutes les interventions synchronisées seront rattachées à ce projet.
+      </div>
+    </div>
+    <div class="field">
       <label>Mots à exclure de l'import des RDV (en plus des mots déjà exclus par défaut)</label>
       <input id="dol_exclude_keywords" type="text" placeholder="ex : livraison, sms, newsletter" value="${escAttr(db.dolibarr.excludeKeywords||'')}">
       <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
@@ -4382,6 +4395,7 @@ function bindSettings(){
     db.dolibarr.rdvOwnerId = val('dol_rdv_owner').trim();
     db.dolibarr.paymentModeId = val('dol_payment_mode').trim();
     db.dolibarr.bankAccountId = val('dol_bank_account').trim();
+    db.dolibarr.projectId = val('dol_project').trim();
     db.dolibarr.excludeKeywords = val('dol_exclude_keywords').trim();
     save();
     alert('Configuration Dolibarr enregistrée.');
