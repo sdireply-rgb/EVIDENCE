@@ -416,6 +416,7 @@ if(!('lastProposalsPull' in db.dolibarr)) db.dolibarr.lastProposalsPull = null;
 if(!('lastAppointmentsPull' in db.dolibarr)) db.dolibarr.lastAppointmentsPull = null;
 if(!('paymentModeId' in db.dolibarr)) db.dolibarr.paymentModeId = '';
 if(!('bankAccountId' in db.dolibarr)) db.dolibarr.bankAccountId = '';
+if(!('projectId' in db.dolibarr)) db.dolibarr.projectId = '';
 
 function save(){
   try{
@@ -2958,6 +2959,9 @@ async function pushInterventionToDolibarr(it){
       note_public: it.notes || '',
       ref_client: it.number
     };
+    // Certaines installations Dolibarr exigent qu'une fiche d'intervention soit rattachée à un
+    // projet ("Bad Request" mentionnant fk_project sinon) — voir Paramètres > ID projet Dolibarr.
+    if(db.dolibarr.projectId) header.fk_project = Number(db.dolibarr.projectId);
     newId = await dolFetch('/interventions', { method:'POST', body: header });
     try{
       await dolFetch(`/interventions/${newId}/lines`, { method:'POST', body:{
@@ -4330,6 +4334,16 @@ function renderSettings(){
       </div>
     </div>
     <div class="field">
+      <label>ID projet Dolibarr (pour les fiches d'intervention)</label>
+      <input id="dol_project" type="number" placeholder="ex : 1" value="${escAttr(db.dolibarr.projectId||'')}">
+      <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+        Certaines installations Dolibarr exigent qu'une fiche d'intervention soit rattachée à un projet
+        (erreur "Bad Request" mentionnant fk_project sinon). Renseigne ici l'ID d'un projet Dolibarr existant
+        (Projets → fiche du projet, visible dans l'URL, ex : ...card.php?id=<b>1</b>) ; laisse vide si ton
+        Dolibarr n'impose pas cette contrainte.
+      </div>
+    </div>
+    <div class="field">
       <label>ID utilisateur Dolibarr propriétaire des RDV</label>
       <input id="dol_rdv_owner" type="number" placeholder="ex : 1" value="${escAttr(db.dolibarr.rdvOwnerId||'')}">
       <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
@@ -4461,6 +4475,7 @@ function bindSettings(){
     db.dolibarr.apiKey = val('dol_key').trim();
     db.dolibarr.autoCreateThirdParty = document.getElementById('dol_autocreate').checked;
     db.dolibarr.warehouseId = val('dol_warehouse').trim();
+    db.dolibarr.projectId = val('dol_project').trim();
     db.dolibarr.rdvOwnerId = val('dol_rdv_owner').trim();
     db.dolibarr.paymentModeId = val('dol_payment_mode').trim();
     db.dolibarr.bankAccountId = val('dol_bank_account').trim();
