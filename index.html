@@ -394,7 +394,7 @@ function load(){
     interventions:[],
     ticketsZ:[],
     counters:{ devis:0, facture:0, bl:0, contrat:0, intervention:0, ticketz:0 },
-    dolibarr:{ url:'', apiKey:'', autoCreateThirdParty:true, lastMorningSync:null, lastEveningSync:null, lastCompanySync:null, lastCompanyError:null, paymentModeId:'', bankAccountId:'', projectId:'', log:[] }
+    dolibarr:{ url:'', apiKey:'', autoCreateThirdParty:true, lastMorningSync:null, lastEveningSync:null, lastCompanySync:null, lastCompanyError:null, paymentModeId:'', bankAccountId:'', log:[] }
   };
 }
 // migration pour bases existantes créées avant les modules Contrats / RDV / Interventions / Ticket Z / Dolibarr
@@ -416,7 +416,6 @@ if(!('lastProposalsPull' in db.dolibarr)) db.dolibarr.lastProposalsPull = null;
 if(!('lastAppointmentsPull' in db.dolibarr)) db.dolibarr.lastAppointmentsPull = null;
 if(!('paymentModeId' in db.dolibarr)) db.dolibarr.paymentModeId = '';
 if(!('bankAccountId' in db.dolibarr)) db.dolibarr.bankAccountId = '';
-if(!('projectId' in db.dolibarr)) db.dolibarr.projectId = '';
 
 function save(){
   try{
@@ -2901,39 +2900,117 @@ async function pushDocToDolibarr(d){
   return newId;
 }
 
-/* ---- Soir : pousse une intervention (fiche d'intervention Dolibarr) ---- */
+/* ---- Liste les fichiers (photos avant/après, signature) d'une intervention pas encore envoyés
+   vers Dolibarr, en dédoublonnant sur le nom de fichier grâce à it.dolibarrUploadedFiles. ---- */
+function interventionPendingFiles(it){
+  const uploaded = new Set(it.dolibarrUploadedFiles || []);
+  const files = [];
+  ((it.photos && it.photos.avant) || []).forEach((p,i)=>{
+    const name = `avant_${i+1}.${dataUrlExt(p)}`;
+    if(!uploaded.has(name)) files.push({ name, data:p });
+  });
+  ((it.photos && it.photos.apres) || []).forEach((p,i)=>{
+    const name = `apres_${i+1}.${dataUrlExt(p)}`;
+    if(!uploaded.has(name)) files.push({ name, data:p });
+  });
+  if(it.signatureClient){
+    const name = 'signature_client.png';
+    if(!uploaded.has(name)) files.push({ name, data: it.signatureClient });
+  }
+  return files;
+}
+
+/* ---- Une intervention doit repartir en synchro soir si : elle n'a encore jamais été créée côté
+   Dolibarr, OU son statut local a changé depuis le dernier envoi, OU elle a des photos/signature
+   pas encore déposées sur la fiche Dolibarr. Avant ce correctif, seul le filtre "date du jour +
+   jamais synchronisée" était utilisé : une fois dolibarrSynced=true (y compris pour les fiches
+   importées DEPUIS Dolibarr), plus aucun changement local (statut "traitée", photos ajoutées...)
+   n'était jamais renvoyé. ---- */
+function interventionNeedsPush(it){
+  if(!it.dolibarrId) return true;
+  if(it.status !== it.dolibarrLastPushedStatus) return true;
+  return interventionPendingFiles(it).length > 0;
+}
+
+/* ---- Soir : pousse une intervention (fiche d'intervention Dolibarr) — crée la fiche si elle
+   n'existe pas encore côté Dolibarr, puis (que ce soit à la création ou sur une fiche déjà liée,
+   y compris importée depuis Dolibarr) répercute le statut local et dépose les photos/signature
+   pas encore envoyées. ---- */
 async function pushInterventionToDolibarr(it){
-  const contact = db.contacts.find(c=>c.id===it.contactId);
-  if(!contact) throw new Error(`${it.number} : aucun client associé, transfert impossible.`);
-  if(!db.dolibarr.projectId) throw new Error(`${it.number} : ID du projet Dolibarr non renseigné (Paramètres > Synchronisation Dolibarr) — obligatoire pour créer une fiche d'intervention (fk_project).`);
-  const socid = await ensureDolibarrThirdParty(contact);
-  const totals = interventionTotals(it);
-  const detailLines = (it.lines||[]).map(l=>`- ${l.desc} x${l.qty} @ ${fmtMoney(l.price)}`).join('\n');
-  const header = {
-    socid: Number(socid),
-    fk_project: Number(db.dolibarr.projectId),
-    date_create: Math.floor(new Date(it.date).getTime()/1000),
-    description: [
-      it.description||'',
-      it.technicien? 'Technicien : '+it.technicien : '',
-      detailLines,
-      totals.ttc ? 'Total TTC pièces/prestations : '+fmtMoney(totals.ttc) : ''
-    ].filter(Boolean).join('\n'),
-    note_public: it.notes || '',
-    ref_client: it.number
-  };
-  const newId = await dolFetch('/interventions', { method:'POST', body: header });
-  try{
-    await dolFetch(`/interventions/${newId}/lines`, { method:'POST', body:{
-      desc: it.description || it.number,
-      duration: Math.round((it.dureeHeures||0)*3600),
-      date: Math.floor(new Date(it.date).getTime()/1000)
-    }});
-  }catch(e){ dolLog('info', `${it.number} : ligne de durée non ajoutée (${e.message}).`); }
-  it.dolibarrId = String(newId);
-  it.dolibarrSynced = true;
-  it.dolibarrSyncedAt = new Date().toISOString();
-  save();
+  let newId = it.dolibarrId;
+  let dolRef = it.dolibarrRef;
+
+  if(!newId){
+    const contact = db.contacts.find(c=>c.id===it.contactId);
+    if(!contact) throw new Error(`${it.number} : aucun client associé, transfert impossible.`);
+    const socid = await ensureDolibarrThirdParty(contact);
+    const totals = interventionTotals(it);
+    const detailLines = (it.lines||[]).map(l=>`- ${l.desc} x${l.qty} @ ${fmtMoney(l.price)}`).join('\n');
+    const header = {
+      socid: Number(socid),
+      date_create: Math.floor(new Date(it.date).getTime()/1000),
+      description: [
+        it.description||'',
+        it.technicien? 'Technicien : '+it.technicien : '',
+        detailLines,
+        totals.ttc ? 'Total TTC pièces/prestations : '+fmtMoney(totals.ttc) : ''
+      ].filter(Boolean).join('\n'),
+      note_public: it.notes || '',
+      ref_client: it.number
+    };
+    newId = await dolFetch('/interventions', { method:'POST', body: header });
+    try{
+      await dolFetch(`/interventions/${newId}/lines`, { method:'POST', body:{
+        desc: it.description || it.number,
+        duration: Math.round((it.dureeHeures||0)*3600),
+        date: Math.floor(new Date(it.date).getTime()/1000)
+      }});
+    }catch(e){ dolLog('info', `${it.number} : ligne de durée non ajoutée (${e.message}).`); }
+    it.dolibarrId = String(newId);
+    it.dolibarrSynced = true;
+    it.dolibarrSyncedAt = new Date().toISOString();
+    save();
+  }
+
+  // Récupère la référence Dolibarr (ex: FI2508-0001), nécessaire pour déposer les pièces jointes
+  // au bon endroit — l'upload par id brut ne fonctionne pas sur toutes les versions de Dolibarr.
+  if(!dolRef){
+    try{
+      const detail = await dolFetch(`/interventions/${newId}`);
+      if(detail && detail.ref) dolRef = detail.ref;
+    }catch(e){ /* on retentera avec l'id brut si besoin */ }
+    if(!dolRef) dolRef = String(newId);
+    it.dolibarrRef = dolRef;
+  }
+
+  // Répercute le statut local (planifiée / terminée) sur la fiche Dolibarr — sans ça une
+  // intervention marquée "traitée" dans Evidence restait indéfiniment ouverte côté Dolibarr.
+  if(it.status !== it.dolibarrLastPushedStatus){
+    try{
+      if(it.status==='terminee'){
+        try{ await dolFetch(`/interventions/${newId}/close`, { method:'POST', body:{} }); }
+        catch(e){ await dolFetch(`/interventions/${newId}`, { method:'PUT', body:{ statut:2 } }); }
+      } else {
+        await dolFetch(`/interventions/${newId}`, { method:'PUT', body:{ statut:1 } });
+      }
+      it.dolibarrLastPushedStatus = it.status;
+      save();
+    }catch(e){ dolLog('info', `${it.number} : statut non répercuté sur Dolibarr (${e.message}).`); }
+  }
+
+  // Dépose les photos avant/après et la signature pas encore envoyées sur la fiche Dolibarr.
+  const pending = interventionPendingFiles(it);
+  if(pending.length){
+    it.dolibarrUploadedFiles = it.dolibarrUploadedFiles || [];
+    for(const f of pending){
+      try{
+        await uploadDolibarrDocument(dolRef, f.name, f.data, 'ficheinter');
+        it.dolibarrUploadedFiles.push(f.name);
+      }catch(e){ dolLog('err', `${it.number} : pièce jointe "${f.name}" non envoyée sur la fiche Dolibarr (${e.message}).`); }
+    }
+    save();
+  }
+
   return newId;
 }
 
@@ -3314,7 +3391,9 @@ async function syncDolibarrInterventionsPull(){
         dolibarrId: String(fi.id),
         dolibarrRef: fi.ref || String(fi.id),
         dolibarrSynced: true,
-        dolibarrSyncedAt: new Date().toISOString()
+        dolibarrSyncedAt: new Date().toISOString(),
+        dolibarrLastPushedStatus: fi.statut>=2 ? 'terminee' : 'planifiee',
+        dolibarrUploadedFiles: []
       };
       db.interventions.push(it);
       added++;
@@ -3553,7 +3632,7 @@ async function syncDolibarrEvening(dateISO){
   const bl = db.documents.filter(d=>d.date===dateISO && d.type==='bl' && !d.dolibarrSynced);
   const livraisonsAProuver = db.documents.filter(d=>d.type==='bl' && d.dolibarrId && ['paye','refuse','absent','reporte'].includes(d.status) && d.dolibarrLastPushedStatus!==d.status);
   const facturesAPayer = db.documents.filter(d=>d.type==='facture' && d.dolibarrId && d.status==='paye' && d.dolibarrLastPushedStatus!=='paye');
-  const interventions = db.interventions.filter(it=>it.date===dateISO && !it.dolibarrSynced);
+  const interventions = db.interventions.filter(it=>interventionNeedsPush(it));
   const contrats = db.contracts.filter(c=>c.date===dateISO && !c.dolibarrSynced);
   let ok=0, fail=0;
   for(const d of devisFactures){
@@ -4277,16 +4356,6 @@ function renderSettings(){
       </div>
     </div>
     <div class="field">
-      <label>ID projet Dolibarr par défaut (pour les interventions)</label>
-      <input id="dol_project" type="number" placeholder="ex : 1" value="${escAttr(db.dolibarr.projectId||'')}">
-      <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
-        Obligatoire pour transférer les fiches d'intervention : l'API Dolibarr exige qu'une intervention
-        soit rattachée à un projet (champ « fk_project »), sinon la synchro échoue avec l'erreur
-        FI2603-0033. Trouve l'ID dans Dolibarr → Projets → fiche du projet (visible dans l'URL, ex :
-        ...card.php?id=<b>1</b>). Toutes les interventions synchronisées seront rattachées à ce projet.
-      </div>
-    </div>
-    <div class="field">
       <label>Mots à exclure de l'import des RDV (en plus des mots déjà exclus par défaut)</label>
       <input id="dol_exclude_keywords" type="text" placeholder="ex : livraison, sms, newsletter" value="${escAttr(db.dolibarr.excludeKeywords||'')}">
       <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
@@ -4395,7 +4464,6 @@ function bindSettings(){
     db.dolibarr.rdvOwnerId = val('dol_rdv_owner').trim();
     db.dolibarr.paymentModeId = val('dol_payment_mode').trim();
     db.dolibarr.bankAccountId = val('dol_bank_account').trim();
-    db.dolibarr.projectId = val('dol_project').trim();
     db.dolibarr.excludeKeywords = val('dol_exclude_keywords').trim();
     save();
     alert('Configuration Dolibarr enregistrée.');
