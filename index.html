@@ -2989,17 +2989,24 @@ async function pushInterventionToDolibarr(it){
 
   // Répercute le statut local (planifiée / terminée) sur la fiche Dolibarr — sans ça une
   // intervention marquée "traitée" dans Evidence restait indéfiniment ouverte côté Dolibarr.
+  // Cycle de vie Dolibarr d'une fiche d'intervention : Brouillon (0) -> Validé (1) -> Traité/Fermé
+  // (3). Le statut "2" n'est un état valable que si l'option cachée FICHINTER_CLASSIFY_BILLED est
+  // activée (intermédiaire "Facturé") — l'envoyer sans cette option ne fait rien, ce qui explique
+  // qu'une intervention marquée "terminée" ici ne ressortait "Validée" côté Dolibarr.
   if(it.status !== it.dolibarrLastPushedStatus){
     try{
       if(it.status==='terminee'){
         try{ await dolFetch(`/interventions/${newId}/close`, { method:'POST', body:{} }); }
-        catch(e){ await dolFetch(`/interventions/${newId}`, { method:'PUT', body:{ statut:2 } }); }
+        catch(e){
+          dolLog('info', `${it.number} : endpoint /close indisponible (${e.message}), tentative via mise à jour directe du statut...`);
+          await dolFetch(`/interventions/${newId}`, { method:'PUT', body:{ statut:3 } });
+        }
       } else {
         await dolFetch(`/interventions/${newId}`, { method:'PUT', body:{ statut:1 } });
       }
       it.dolibarrLastPushedStatus = it.status;
       save();
-    }catch(e){ dolLog('info', `${it.number} : statut non répercuté sur Dolibarr (${e.message}).`); }
+    }catch(e){ dolLog('err', `${it.number} : statut non répercuté sur Dolibarr — ${e.message}`); }
   }
 
   // Dépose les photos avant/après et la signature pas encore envoyées sur la fiche Dolibarr.
@@ -3386,7 +3393,7 @@ async function syncDolibarrInterventionsPull(){
         technicien: fi.fk_user_author_name || fi.user_author || '',
         description: fi.description || fi.note_private || (fi.ref ? 'Intervention '+fi.ref : 'Intervention Dolibarr'),
         dureeHeures: dureeHeures || 0,
-        status: fi.statut>=2 ? 'terminee' : 'planifiee',
+        status: fi.statut>=3 ? 'terminee' : 'planifiee',
         notes: fi.note_public || '',
         lines: linesMapped,
         photos:{ avant:[], apres:[] },
@@ -3396,7 +3403,7 @@ async function syncDolibarrInterventionsPull(){
         dolibarrRef: fi.ref || String(fi.id),
         dolibarrSynced: true,
         dolibarrSyncedAt: new Date().toISOString(),
-        dolibarrLastPushedStatus: fi.statut>=2 ? 'terminee' : 'planifiee',
+        dolibarrLastPushedStatus: fi.statut>=3 ? 'terminee' : 'planifiee',
         dolibarrUploadedFiles: []
       };
       db.interventions.push(it);
