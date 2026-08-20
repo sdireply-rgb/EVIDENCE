@@ -2965,8 +2965,8 @@ async function pushInterventionToDolibarr(it){
     newId = await dolFetch('/interventions', { method:'POST', body: header });
     try{
       await dolFetch(`/interventions/${newId}/lines`, { method:'POST', body:{
-        desc: it.description || it.number,
-        duration: Math.round((it.dureeHeures||0)*3600),
+        description: it.description || it.number,
+        duree: Math.round((it.dureeHeures||0)*3600),
         date: Math.floor(new Date(it.date).getTime()/1000)
       }});
     }catch(e){ dolLog('info', `${it.number} : ligne de durée non ajoutée (${e.message}).`); }
