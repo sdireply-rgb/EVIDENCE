@@ -2394,7 +2394,16 @@ function openInterventionModal(id){
       technicien: val('i_tech'), description: val('i_desc'), dureeHeures: parseFloat(val('i_duree'))||0,
       status: val('i_status'), notes: val('i_notes'), clientPresent: val('i_clientPresent'),
       lines: wLines.filter(l=>l.desc && l.desc.trim()!==''),
-      photos: wPhotos, signatureClient: wSig
+      photos: wPhotos, signatureClient: wSig,
+      // On conserve le lien Dolibarr existant (id, ref, dates de synchro, dernier statut poussé,
+      // fichiers déjà envoyés, validation) : sans ça, chaque édition/sauvegarde d'une intervention
+      // (par ex. la passer en "traitée") effaçait ces infos, et la synchro du soir la traitait alors
+      // comme une toute nouvelle fiche à créer côté Dolibarr au lieu de mettre à jour/valider celle
+      // déjà existante — d'où des fiches qui restaient bloquées en Brouillon et des doublons.
+      dolibarrId: it.dolibarrId, dolibarrRef: it.dolibarrRef,
+      dolibarrSynced: it.dolibarrSynced, dolibarrSyncedAt: it.dolibarrSyncedAt,
+      dolibarrLastPushedStatus: it.dolibarrLastPushedStatus, dolibarrValidated: it.dolibarrValidated,
+      dolibarrUploadedFiles: it.dolibarrUploadedFiles, source: it.source
     };
   }
   document.getElementById('saveBtn').onclick = ()=>{
@@ -2930,6 +2939,11 @@ function interventionPendingFiles(it){
 function interventionNeedsPush(it){
   if(!it.dolibarrId) return true;
   if(it.status !== it.dolibarrLastPushedStatus) return true;
+  // Filet de rattrapage pour les interventions déjà passées "terminee" via une version antérieure du
+  // code (avant ce correctif), où dolibarrLastPushedStatus avait été figé sur "terminee" même si
+  // l'appel de clôture Dolibarr avait en réalité échoué (mauvais endpoint /close au lieu de
+  // /closeFichinter) : sans ce test, ces fiches ne seraient plus jamais re-proposées à la synchro.
+  if(it.status==='terminee' && !it.dolibarrClosed) return true;
   return interventionPendingFiles(it).length > 0;
 }
 
@@ -2963,9 +2977,19 @@ async function pushInterventionToDolibarr(it){
     // projet ("Bad Request" mentionnant fk_project sinon) — voir Paramètres > ID projet Dolibarr.
     if(db.dolibarr.projectId) header.fk_project = Number(db.dolibarr.projectId);
     newId = await dolFetch('/interventions', { method:'POST', body: header });
+    // Garde-fou : selon la convention Dolibarr, la méthode de création sous-jacente renvoie un
+    // nombre négatif en cas d'échec côté serveur (champ obligatoire manquant, etc.), mais l'API
+    // REST de ce module ne traduit pas toujours ça en une vraie erreur HTTP — le nombre négatif
+    // peut donc remonter tel quel comme si c'était un id valide. Sans ce contrôle, les appels
+    // suivants (validate, lignes...) échouaient avec un mystérieux "Intervention not found" au
+    // lieu de pointer clairement vers l'échec réel de la création.
+    if(!(Number(newId) > 0)){
+      throw new Error(`création refusée par Dolibarr (réponse reçue : ${JSON.stringify(newId)}) — vérifie que le client/projet associé est valide et que les champs obligatoires sont correctement renseignés.`);
+    }
     try{
       await dolFetch(`/interventions/${newId}/lines`, { method:'POST', body:{
         description: it.description || it.number,
+        duration: Math.round((it.dureeHeures||0)*3600),
         duree: Math.round((it.dureeHeures||0)*3600),
         date: Math.floor(new Date(it.date).getTime()/1000)
       }});
@@ -2987,24 +3011,66 @@ async function pushInterventionToDolibarr(it){
     it.dolibarrRef = dolRef;
   }
 
-  // Répercute le statut local (planifiée / terminée) sur la fiche Dolibarr — sans ça une
-  // intervention marquée "traitée" dans Evidence restait indéfiniment ouverte côté Dolibarr.
-  // Cycle de vie Dolibarr d'une fiche d'intervention : Brouillon (0) -> Validé (1) -> Traité/Fermé
-  // (3). Le statut "2" n'est un état valable que si l'option cachée FICHINTER_CLASSIFY_BILLED est
-  // activée (intermédiaire "Facturé") — l'envoyer sans cette option ne fait rien, ce qui explique
-  // qu'une intervention marquée "terminée" ici ne ressortait "Validée" côté Dolibarr.
-  if(it.status !== it.dolibarrLastPushedStatus){
+  // Répercute le statut local (planifiée / en cours / traitée) sur la fiche Dolibarr — sans ça une
+  // intervention marquée "traitée" dans Evidence restait indéfiniment en Brouillon côté Dolibarr.
+  // Cycle de vie Dolibarr d'une fiche d'intervention : Brouillon (0) -> Validé (1) -> Fermé/Traité (3).
+  // IMPORTANT : un PUT direct avec { statut:1 } ne suffit PAS à faire passer la fiche de Brouillon à
+  // Validé — l'API Dolibarr n'applique le changement de statut d'un document "workflow" (devis,
+  // facture, commande, expédition, contrat, intervention...) que via son action dédiée /validate,
+  // exactement comme pour les autres types de documents plus haut dans ce fichier (pushDocToDolibarr,
+  // pushBLToDolibarr, etc.). Un PUT sur le champ statut est silencieusement ignoré par l'API, ce qui
+  // explique que la fiche restait en Brouillon (et donc avec une référence provisoire "(PROV...)",
+  // d'où des numéros qui ne se suivent pas une fois les fiches enfin validées manuellement) même
+  // quand Evidence pensait avoir synchronisé un changement de statut.
+  // Autre point lié : /close (comme /validate d'ailleurs) exige que la fiche soit déjà validée —
+  // fermer une fiche encore en Brouillon échoue ou ne fait rien. On valide donc toujours d'abord.
+  if(it.status !== it.dolibarrLastPushedStatus || !it.dolibarrValidated || (it.status==='terminee' && !it.dolibarrClosed)){
     try{
-      if(it.status==='terminee'){
-        try{ await dolFetch(`/interventions/${newId}/close`, { method:'POST', body:{} }); }
-        catch(e){
-          dolLog('info', `${it.number} : endpoint /close indisponible (${e.message}), tentative via mise à jour directe du statut...`);
-          await dolFetch(`/interventions/${newId}`, { method:'PUT', body:{ statut:3 } });
+      if(!it.dolibarrValidated){
+        try{
+          // NB : sur cette instance Dolibarr, le paramètre `notrigger` de l'action /validate des
+          // fiches d'intervention n'est pas lu depuis le corps JSON (d'où l'erreur "Expecting
+          // integer value" même en envoyant 0) — il faut le passer en paramètre d'URL.
+          await dolFetch(`/interventions/${newId}/validate?notrigger=0`, { method:'POST', body:{} });
+          it.dolibarrValidated = true;
+          // La validation remplace la référence provisoire "(PROV...)" par la référence définitive
+          // côté Dolibarr — on la relit pour que dolibarrRef (et son affichage dans Evidence) reflète
+          // la vraie référence, plutôt que de garder indéfiniment la réf provisoire captée à la
+          // création (avant validation).
+          try{
+            const detail = await dolFetch(`/interventions/${newId}`);
+            if(detail && detail.ref){ dolRef = detail.ref; it.dolibarrRef = dolRef; }
+          }catch(e){ /* pas bloquant : on garde l'ancienne réf en attendant la prochaine synchro */ }
+          save();
+        }catch(e){
+          // Déjà validée côté Dolibarr (ex: fiche créée/importée directement là-bas) -> pas
+          // bloquant, on continue. Selon les versions, Dolibarr répond soit avec un message
+          // explicite, soit avec un simple HTTP 304 (Not Modified) sans détail.
+          if(/already validated|déjà validé|304/i.test(e.message)) it.dolibarrValidated = true;
+          else dolLog('err', `${it.number} : échec de la validation Dolibarr — ${e.message}`);
         }
-      } else {
-        await dolFetch(`/interventions/${newId}`, { method:'PUT', body:{ statut:1 } });
       }
-      it.dolibarrLastPushedStatus = it.status;
+      let statusFullyApplied = true;
+      if(it.status==='terminee' && it.dolibarrValidated){
+        // IMPORTANT : les logs confirment que l'endpoint "/closeFichinter" n'existe pas sur cette
+        // instance (404 systématique, y compris sur des fiches avec un id Dolibarr valide et
+        // fonctionnel) — retour à "/close", qui correspond à la méthode close() réellement présente
+        // dans la classe Fichinter de Dolibarr. Comme pour /validate plus haut, on passe `notrigger`
+        // en paramètre d'URL plutôt que dans le corps JSON.
+        try{
+          await dolFetch(`/interventions/${newId}/close?notrigger=0`, { method:'POST', body:{} });
+          it.dolibarrClosed = true;
+        }catch(e){
+          dolLog('err', `${it.number} : échec de la clôture Dolibarr (endpoint /close) — ${e.message}`);
+          // On NE marque PAS statusFullyApplied à true ici : un PUT direct sur "statut" est ignoré
+          // par l'API pour ce type de document (comme pour /validate plus haut), donc il ne faut pas
+          // considérer l'opération comme réussie ni figer dolibarrLastPushedStatus sur "terminee" —
+          // sans ça, la prochaine synchro ne retenterait plus jamais la clôture (interventionNeedsPush
+          // ne détecterait plus aucun changement de statut à répercuter).
+          statusFullyApplied = false;
+        }
+      }
+      if(statusFullyApplied){ it.dolibarrLastPushedStatus = it.status; }
       save();
     }catch(e){ dolLog('err', `${it.number} : statut non répercuté sur Dolibarr — ${e.message}`); }
   }
@@ -3200,7 +3266,7 @@ async function pushDeliveryProofToDolibarr(d){
         try{ await dolFetch(`/shipments/${d.dolibarrId}/validate`, { method:'POST', body:{} }); }
         catch(e){ dolLog('err', `${d.number} : impossible de valider l'expédition Dolibarr avant clôture (${e.message}).`); }
       }
-      await dolFetch(`/shipments/${d.dolibarrId}/close`, { method:'POST', body:{ notrigger:0 } });
+      await dolFetch(`/shipments/${d.dolibarrId}/close?notrigger=0`, { method:'POST', body:{} });
       dolLog('ok', `${d.number} : expédition Dolibarr clôturée (statut "Livrée/Expédiée").`);
       try{ await pushDolibarrDeliveryExtrafield(d.dolibarrId, 'livree'); }
       catch(e){ dolLog('err', `${d.number} : statut réel "livrée" non écrit dans le champ complémentaire Dolibarr (${e.message}).`); }
@@ -3404,6 +3470,10 @@ async function syncDolibarrInterventionsPull(){
         dolibarrSynced: true,
         dolibarrSyncedAt: new Date().toISOString(),
         dolibarrLastPushedStatus: fi.statut>=3 ? 'terminee' : 'planifiee',
+        // La fiche existe déjà côté Dolibarr avec un statut Validé (1) ou Fermé (3) — inutile (et en
+        // fait source d'erreur, voir plus bas) de retenter une validation dessus plus tard. Seul le
+        // statut Brouillon (0) doit encore être validé.
+        dolibarrValidated: Number(fi.statut) >= 1,
         dolibarrUploadedFiles: []
       };
       db.interventions.push(it);
@@ -3599,7 +3669,7 @@ async function pushContractToDolibarr(ct){
     }catch(e){ /* on retentera l'upload avec l'id brut si besoin */ }
     if(!dolRef) dolRef = String(newId);
     if(ct.status==='signe'){
-      try{ await dolFetch(`/contracts/${newId}/validate`, { method:'POST', body:{ notrigger:0 } }); }
+      try{ await dolFetch(`/contracts/${newId}/validate?notrigger=0`, { method:'POST', body:{} }); }
       catch(e){ dolLog('info', `${ct.number} : contrat Dolibarr créé mais non validé (${e.message}).`); }
     }
   }
